@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+# experiment outputs land next to the scripts; the reference copies live in results/
+*.png
+*.pdf
+*.json
+!results/*.json
+
+# datasets are not vendored (see datasets.py)
+data/
