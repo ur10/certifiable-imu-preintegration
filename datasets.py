@@ -9,6 +9,10 @@ two environment variables below at your own copies, or edit the fallbacks:
 `EUROC_MH01` must be the `mav0` directory itself -- the one containing `imu0/data.csv` and
 `state_groundtruth_estimate0/data.csv`.
 
+The demos in `demos/` run on several EuRoC Machine Hall sequences. They look for
+`$EUROC_ROOT/<name>/mav0` (e.g. `$EUROC_ROOT/MH_04_difficult/mav0`), defaulting to `data/euroc/`;
+MH_01_easy also falls back to `EUROC_MH01`.
+
 `URBANNAV_ROOT` must be the directory holding the UrbanNav sequences; see `urbannav_data.py`
 for the layout it expects. Only the medium-urban and deep-urban sequences are used.
 
@@ -22,6 +26,9 @@ _DEFAULT_EUROC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 _DEFAULT_URBANNAV = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'urbannav')
 
 EUROC = os.environ.get('EUROC_MH01', _DEFAULT_EUROC)
+EUROC_ROOT = os.environ.get('EUROC_ROOT', os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                       'data', 'euroc'))
+EUROC_SEQUENCES = ('MH_01_easy', 'MH_02_easy', 'MH_03_medium', 'MH_04_difficult', 'MH_05_difficult')
 URBANNAV = os.environ.get('URBANNAV_ROOT', _DEFAULT_URBANNAV)
 
 
@@ -38,6 +45,15 @@ def require(path, what, env_var, example):
 def euroc():
     return require(EUROC, 'EuRoC MH_01 (mav0)', 'EUROC_MH01',
                    '/path/to/MH_01_easy/mav0')
+
+
+def euroc_sequence(name):
+    """The `mav0` directory of EuRoC sequence `name`, e.g. 'MH_04_difficult'."""
+    path = os.path.join(EUROC_ROOT, name, 'mav0')
+    if not os.path.exists(path) and name == 'MH_01_easy' and 'EUROC_MH01' in os.environ:
+        path = EUROC
+    return require(path, 'EuRoC %s (mav0)' % name, 'EUROC_ROOT',
+                   '/path/to/euroc   # containing %s/mav0/' % name)
 
 
 def urbannav():

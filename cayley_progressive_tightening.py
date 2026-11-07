@@ -16,35 +16,11 @@ import numpy as np
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import sdp_preintegration_cayley as C
-from sdp_preintegration_cayley import skew
-import cayley_dual_certificate as D
 
-_CAP = {}
-def _wrapped(layout, edges, anchors, scalar_priors=None, add_redundant=True, obj_scale=1.0,
-             solver_params=None, accept_any=False, diag=None, rw_pairs=None):
-    Q, Qs, osc, Z, A, b, y = D.solve_with_duals(
-        layout, edges, anchors, scalar_priors=scalar_priors, add_redundant=add_redundant,
-        obj_scale=obj_scale, solver_params=solver_params, rw_pairs=rw_pairs)
-    _CAP.update(Q=Q, Qs=Qs, osc=osc, Z=Z, A=A, b=b, y=y, lay=layout, ed=edges)
-    return Z, Q, float(np.sum(Q * Z))
-C.solve_cayley_sdp = _wrapped
-
-def _xhat(lay, edges, R, v, p, bg, ba):
-    x = np.zeros(lay.n)
-    for k in range(lay.N):
-        x[lay.R0+9*k:lay.R0+9*(k+1)] = R[k].flatten('F')
-        x[lay.v(k,0):lay.v(k,0)+3] = v[k]; x[lay.p(k,0):lay.p(k,0)+3] = p[k]
-    bg = np.atleast_2d(bg); ba = np.atleast_2d(ba)
-    for m in range(lay.M):
-        x[lay.bg(m,0):lay.bg(m,0)+3] = bg[m]; x[lay.ba(m,0):lay.ba(m,0)+3] = ba[m]
-    for e, ed in enumerate(edges):
-        vv = ed.JR @ bg[ed.blk]
-        x[lay.Y0+9*e:lay.Y0+9*(e+1)] = (R[ed.i]@ed.dRt@skew(vv)).flatten('F')
-        x[lay.Yp0+9*e:lay.Yp0+9*(e+1)] = (R[ed.j]@skew(vv)).flatten('F')
-        x[lay.Zv(e,0):lay.Zv(e,0)+3] = R[ed.i]@(ed.Avg@bg[ed.blk]+ed.Ava@ba[ed.blk])
-        x[lay.Zp(e,0):lay.Zp(e,0)+3] = R[ed.i]@(ed.Apg@bg[ed.blk]+ed.Apa@ba[ed.blk])
-    x[lay.si] = 1.0
-    return x
+# The certified duality gap uses the dual bound solve_cayley_sdp now computes itself
+# (dual_lb = b^T y + min(0, lambda_min(S)) tr Z, S = Q - sum y_m A_m), on the conditioned SDP.
+# This script previously swapped in cayley_dual_certificate.solve_with_duals, which solves the
+# unconditioned problem with obj_scale='auto'.
 
 STAGES = [("none",            ()),
           ("+A1,A2",          ('A1','A2')),
@@ -56,7 +32,7 @@ SIGMAS = [1e-4, 1e-3, 1e-2, 1e-1, 1e0]
 NOMINAL = 1e-3      # modelled noise density -> fixes the weights; only the injection varies
 # Same solver/weighting configuration as the EuRoC and UrbanNav runs of
 # cayley_multibias_experiment.py, so the three experiments are directly comparable.
-BASE = dict(weight_mode='dataset_cov', iso_reduce='mean', obj_scale='auto',
+BASE = dict(weight_mode='dataset_cov', iso_reduce='mean', obj_scale=1.0,
             prior_sigmas=(1e-2, 1e-2, 1e-3, 1e-3), accept_any=True)
 SURF='#fcfcfb'; GRID='#e1e0d9'; AXIS='#c3c2b7'; MUTED='#898781'; INK='#0b0b0b'; INK2='#52514e'
 COLS = ['#e34948','#c77b1e','#b0a02a','#2a9d5c','#2a78d6','#008300']
@@ -75,16 +51,11 @@ def run(scenarios=('sick','loop'), T=7.0, dt=0.01):
                     r = C.run_synthetic(sc, T=T, dt=dt, gyro_sigma=NOMINAL,
                                         accel_sigma=NOMINAL, noise_sigma=s,
                                         add_redundant=red, **BASE)
-                    if r['rank'] is None:
+                    if r['rank'] is None or r.get('dual_lb') is None:
                         rk.append(np.nan); gp.append(np.nan)
                     else:
-                        Q,Qs,osc,Z,A,b_,y,lay,ed = (_CAP[k] for k in
-                            ('Q','Qs','osc','Z','A','b','y','lay','ed'))
-                        R,v,pp,bg,ba = C.extract_solution(Z, lay)
-                        xh = _xhat(lay, ed, R, v, pp, bg, ba)
-                        rounded = float(xh @ Q @ xh)
-                        out, best = D.certify(Q, Qs, osc, A, b_, y, xh)
-                        rk.append(r['rank']); gp.append(max(rounded - out[best]['bound'], 1e-14))
+                        rk.append(r['rank'])
+                        gp.append(max(float(r['rounded']) - float(r['dual_lb']), 1e-14))
                 except Exception as e:
                     rk.append(np.nan); gp.append(np.nan)
             res[sc][lab] = dict(rank=rk, gap=gp)

@@ -1,8 +1,10 @@
 """Uniform experiment suite: one configuration everywhere, weight_mode the only variation.
 
 Fixed across every run in this file:
-  * obj_scale = 'auto'          (Q rescaled so max|Q| ~ 1e4, keeps MOSEK in its tolerance band)
-  * gauge_fix = False           (no hard anchor; GNSS v/p priors on *every* node, first_node=0)
+  * conditioning = 'centre_whiten', obj_scale = 1.0   (exact centre-and-whiten congruence of the
+                                SDP, see solve_cayley_sdp; replaces the scalar obj_scale='auto')
+  * gauge_fix = 'R'             (hard-anchor R_0; GNSS v/p priors on *every* node, first_node=0).
+                                The shipped results/*.json were produced with gauge_fix=False.
   * prior_sigmas = (1e-2, 1e-2, 1e-3, 1e-3)
   * kf_interval = 1.0 s, accept_any = True, full redundant catalog unless a stage says otherwise
 
@@ -29,8 +31,8 @@ URBANNAV = datasets.URBANNAV    # override with $URBANNAV_ROOT
 # The one configuration
 # --------------------------------------------------------------------------- #
 UNIFORM = dict(kf_interval=1.0, prior_sigmas=(1e-2, 1e-2, 1e-3, 1e-3),
-               obj_scale='auto', accept_any=True,
-               gauge_fix=False, R0_prior_sigma=None)
+               obj_scale=1.0, conditioning='centre_whiten', accept_any=True,
+               gauge_fix='R', R0_prior_sigma=None)
 
 MODES = {'mle': {}, 'dataset_cov': dict(iso_reduce='mean')}
 
@@ -61,7 +63,9 @@ def _rec(r, **meta):
              rel=abs(f - p) / abs(f) if abs(f) > 0 else float('nan'),
              rot_mean=float(np.mean(r['rot_err'])), rot_max=float(np.max(r['rot_err'])),
              n_var=int(r.get('n_var', 0)), num_bias=int(r.get('num_bias', 1)),
-             status=str(r.get('status', 'ok')))
+             status=str(r.get('status', 'ok')), eta_dual=r.get('eta_dual'),
+             lmin_S=r.get('lmin_S'), solsta=r.get('solsta'), conditioning=r.get('conditioning'),
+             log_svr=float(r['log_svr']))
     return d
 
 

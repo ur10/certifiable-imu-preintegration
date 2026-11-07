@@ -55,4 +55,9 @@ def main(out='traj_teaser.json'):
 
 
 if __name__ == '__main__':
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--gauge', default=X.GAUGE, choices=['R', 'free'],
+                    help="free: no rotation anchor in either estimator (the paper's Fig. 1)")
+    X.GAUGE = {'R': 'R', 'free': False}[ap.parse_args().gauge]
     main()

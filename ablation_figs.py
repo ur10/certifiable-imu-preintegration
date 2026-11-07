@@ -76,7 +76,7 @@ def _style(ax):
 
 
 def fig_rate(png='ablation_rate.png', src=OUT_JSON):
-    """Certified rate vs noise, authored at the \columnwidth it is included at.
+    r"""Certified rate vs noise, authored at the \columnwidth it is included at.
 
     Three of the five curves sit identically at zero for every sigma, so they are drawn with
     nested open markers (large to small) instead of being hidden underneath one another.

@@ -1,6 +1,15 @@
-# Tested on Python 3.9.18
-numpy==1.23.3
-scipy==1.13.1
-matplotlib==3.9.4
-gtsam
+# Two tested environments. gtsam MUST match numpy's major version: the gtsam 4.2.x wheels are built
+# against NumPy 1.x and segfault under NumPy 2 (PreintegrationParams.setGyroscopeCovariance, which
+# every synthetic run and the GTSAM baseline call). Real-data SDP runs do not touch gtsam's IMU
+# bindings, so they "work" in a mismatched env and hide the problem.
+#
+# (a) Python 3.13 venv, NumPy 2 -- recommended:
+#       python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+# (b) the env the paper was run in, Python 3.9.18: numpy==1.23.3 scipy==1.13.1 matplotlib==3.9.4
+#     gtsam==4.2 mosek==11.2.0. Use it to reproduce Table III exactly: gtsam 4.3 moves the LM
+#     baseline cost by ~2e-4 relative; the Cayley SDP results agree to solver precision (~1e-7).
+numpy>=2.0
+scipy>=1.13
+matplotlib>=3.9
+gtsam==4.3.0
 mosek==11.2.0        # commercial; free academic licence -> ~/mosek/mosek.lic

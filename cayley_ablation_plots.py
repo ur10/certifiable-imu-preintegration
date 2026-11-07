@@ -44,7 +44,7 @@ SCEN = ('sick', 'loop')
 NOMINAL = 1e-3                    # modelled density held fixed; only injected noise varies
 
 
-def run(out=OUT_JSON, T=8.0, kf_per_bias=4):
+def run(out=OUT_JSON, T=8.0, kf_per_bias=4, gauge_fix='R'):
     rows = []
     for si, (lab, fams) in enumerate(STAGES):
         red = True if len(fams) == len(C.ALL_FAMILIES) else (fams if fams else False)
@@ -55,7 +55,7 @@ def run(out=OUT_JSON, T=8.0, kf_per_bias=4):
                     try:
                         r = U._solve(sc, 'dataset_cov', T=T, dt=0.01, kf_per_bias=kf_per_bias,
                                      gyro_sigma=NOMINAL, accel_sigma=NOMINAL, noise_sigma=s,
-                                     add_redundant=red, seed=sd)
+                                     add_redundant=red, seed=sd, gauge_fix=gauge_fix)
                     except Exception as exc:
                         r = None
                         print('  EXC %s %s %g s%d: %s' % (lab, sc, s, sd, exc), flush=True)
@@ -65,6 +65,8 @@ def run(out=OUT_JSON, T=8.0, kf_per_bias=4):
                                      log_svr=float(r['log_svr']) if ok else None,
                                      eta=float(r['eta']) if ok else None,
                                      rel=float(r['rel_gap']) if ok else None,
+                                     eta_dual=r.get('eta_dual') if ok else None,
+                                     solsta=r.get('solsta') if ok else None,
                                      n_var=int(r.get('n_var', 0)) if ok else None,
                                      M=int(r.get('num_bias', 0)) if ok else None,
                                      secs=time.time() - t0))
@@ -82,5 +84,7 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--T', type=float, default=8.0)
     ap.add_argument('--kfpb', type=int, default=4)
+    ap.add_argument('--gauge', default='R', choices=['R', 'free', 'full'],
+                    help="R: hard-anchor R_0 (default); free: GNSS priors only (the paper's Fig. 3)")
     a = ap.parse_args()
-    run(T=a.T, kf_per_bias=a.kfpb)
+    run(T=a.T, kf_per_bias=a.kfpb, gauge_fix={'R': 'R', 'free': False, 'full': True}[a.gauge])

@@ -133,8 +133,16 @@ def solve_gtsam(gyro, acc, dt, kf_idx, bgbar, babar, R_t, v_t, p_t, blk,
                 nd_g, nd_a, prior_sigmas, gyro_rw, accel_rw, kf_interval,
                 gravity=9.81, initialisation='gnss', seed=0,
                 rot_sigma_deg=0.0, pos_sigma=0.0, heading_deg=0.0, integration_sigma=1e-6,
-                bias_init_k=0.0, max_iter=200, lambda_upper=1e12):
-    """Build and solve the exp-map factor graph. kf_idx[k] indexes the IMU stream at node k."""
+                bias_init_k=0.0, max_iter=200, lambda_upper=1e12, anchor_R0=None,
+                anchor_sigma=1e-6, bias_prior_sigmas=None):
+    """Build and solve the exp-map factor graph. kf_idx[k] indexes the IMU stream at node k.
+
+    anchor_R0 (3x3) adds a rotation-only prior on X(0) with stddev anchor_sigma [rad], the LM
+    counterpart of the SDP's gauge_fix='R' hard anchor.
+
+    bias_prior_sigmas=(sigma_bg, sigma_ba) overrides the B_0 prior, which otherwise comes from the
+    random walk over the window (the SDP's bias_prior_rw=False counterpart).
+    """
     rng = np.random.default_rng(seed)
     N = len(kf_idx)
     M = int(max(blk)) + 1
@@ -164,9 +172,16 @@ def solve_gtsam(gyro, acc, dt, kf_idx, bgbar, babar, R_t, v_t, p_t, blk,
         graph.push_back(gtsam.GPSFactor(X(k), p_t[k], pos_noise))
         graph.push_back(gtsam.PriorFactorVector(V(k), v_t[k], vel_noise))
 
+    if anchor_R0 is not None:
+        graph.push_back(gtsam.PoseRotationPrior3D(
+            X(0), gtsam.Rot3(np.asarray(anchor_R0, float)),
+            gtsam.noiseModel.Isotropic.Sigma(3, float(anchor_sigma))))
+
     # --- bias prior on B_0 and random walk between blocks --------------------------------
     bdt = kf_interval * (N - 1)
     sig_bg, sig_ba = gyro_rw * np.sqrt(bdt), accel_rw * np.sqrt(bdt)
+    if bias_prior_sigmas is not None:
+        sig_bg, sig_ba = map(float, bias_prior_sigmas)
     graph.push_back(gtsam.PriorFactorConstantBias(
         B(0), bias_lin, gtsam.noiseModel.Diagonal.Sigmas(np.r_[np.full(3, sig_ba), np.full(3, sig_bg)])))
     if M > 1:

@@ -9,3 +9,12 @@ __pycache__/
 
 # datasets are not vendored (see datasets.py)
 data/
+.venv/
+
+# shipped outputs: the demo figures and data, and the re-runs under runs/
+!demos/figures/*.png
+!demos/out/*.json
+!runs/**/*.json
+!runs/**/*.png
+!runs/**/*.pdf
+*.log

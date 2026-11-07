@@ -93,6 +93,11 @@ def load_urbannav_window(root, sequence, T, kf_interval, t_start, kf_per_bias=No
                 gyro_rw=float(nd['gyro_rw']), accel_rw=float(nd['accel_rw']))
 
 
+# Gauge shared by both estimators so the comparison stays matched: 'R' hard-anchors R_0 in the
+# SDP and adds an (effectively hard) rotation prior on X(0) to the LM graph; False uses neither.
+GAUGE = 'R'
+
+
 def load_window(ds, T, kfi, off, kfpb):
     if ds == 'euroc':
         return load_euroc_window(EUROC, T, kfi, off, kfpb)
@@ -101,7 +106,7 @@ def load_window(ds, T, kfi, off, kfpb):
 
 def solve_ours(ds, T, kfi, off, kfpb, prior_sigmas):
     kw = dict(T=T, kf_interval=kfi, t_start=off, weight_mode='dataset_cov', iso_reduce='mean',
-              obj_scale='auto', prior_sigmas=prior_sigmas, gauge_fix=False, accept_any=True,
+              obj_scale=1.0, conditioning='centre_whiten', prior_sigmas=prior_sigmas, gauge_fix=GAUGE, accept_any=True,
               add_redundant=True, kf_per_bias=kfpb)
     if ds == 'euroc':
         return C.run_euroc(EUROC, gyro_nd=ND_G, accel_nd=ND_A,
@@ -135,7 +140,8 @@ def run_gtsam(W, prior_sigmas, init, seed=0, **kw):
     return solve_gtsam(W['gyro'], W['acc'], W['dt'], W['kf_idx'], W['bgbar'], W['babar'],
                        W['R_t'], W['v_t'], W['p_t'], W['blk'],
                        W['nd_g'], W['nd_a'], prior_sigmas, W['gyro_rw'], W['accel_rw'],
-                       kf_interval=1.0, gravity=W['gravity'], initialisation=init, seed=seed, **kw)
+                       kf_interval=1.0, gravity=W['gravity'], initialisation=init, seed=seed,
+                       anchor_R0=W['R_t'][0] if GAUGE == 'R' else None, **kw)
 
 
 # --------------------------------------------------------------------------- #
@@ -158,6 +164,7 @@ def exp_matched(out='matched.json'):
                 rows.append(dict(ds=ds, off=off, **summarize(
                     'cayley-sdp', r['R_est'], r['v_est'], r['p_est'], W,
                     dict(secs=secs, rank=int(r['rank']), eta=float(r['eta']),
+                         eta_dual=r.get('eta_dual'), solsta=r.get('solsta'),
                          certified=bool(r['rank'] == 1), n_var=int(r['n_var'])))))
             for init in ('gt', 'gnss'):
                 g = run_gtsam(W, PRIOR_SIGMAS, init)
@@ -202,6 +209,7 @@ def exp_divergence(out='divergence.json', ds='euroc', T=16.0, off=6.0, kfpb=8):
             rows.append(dict(sigma=sp, **summarize(
                 'cayley-sdp', r['R_est'], r['v_est'], r['p_est'], W,
                 dict(secs=secs, rank=int(r['rank']), eta=float(r['eta']),
+                     eta_dual=r.get('eta_dual'), solsta=r.get('solsta'),
                      log_svr=float(r['log_svr']), certified=bool(r['rank'] == 1)))))
         at = [d for d in rows if d['sigma'] == sp]
         ref_ = [d for d in at if d['method'] == 'gtsam-gt'][0]

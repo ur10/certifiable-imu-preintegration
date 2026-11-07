@@ -81,7 +81,18 @@ def cayley_preintegrate(gyro, acc, dt, bgbar, babar):
     return dict(dR=dR, dv=dv, dp=dp, JR=JR, Avg=Avg, Ava=Ava, Apg=Apg, Apa=Apa)
 
 
-def preintegrate_covariance(gyro, acc, dt, bgbar, babar, sig_g, sig_a, iso_input=False):
+def iso_project(Sig):
+    """Nearest (Frobenius) isotropic-block matrix: every 3x3 block B_ab -> tr(B_ab)/3 * I_3.
+
+    Equivalently S kron I_3 with S = Tr_axis(Sig)/3, a partial trace over the spatial factor, so it
+    maps PSD to PSD. Cross-covariance blocks are kept, as scalar multiples of I_3.
+    """
+    S = np.einsum('aibi->ab', np.asarray(Sig).reshape(3, 3, 3, 3)) / 3.0
+    return np.kron(S, I3)
+
+
+def preintegrate_covariance(gyro, acc, dt, bgbar, babar, sig_g, sig_a, iso_input=False,
+                            iso_propagate=False):
     """Standard preintegration covariance recursion (Forster et al., Cayley variant):
 
         Sigma_ij = A_{j-1} Sigma_{i,j-1} A_{j-1}^T + B_{j-1} Sigma_eta B_{j-1}^T
@@ -97,6 +108,10 @@ def preintegrate_covariance(gyro, acc, dt, bgbar, babar, sig_g, sig_a, iso_input
     inflates the gyro density 11.8x and cuts tau_R/tau_v from 85 to 16 -- the same collapse that
     weight_mode='mle' performs. It is statistically worse but compresses the weight dynamic range,
     which matters when obj_scale=1.0 leaves max|Q| ~ 1e8.
+    iso_propagate=True keeps the covariance isotropic THROUGHOUT the interval: after every step
+    Sigma is projected onto the isotropic-block subspace {S kron I_3} (iso_project), so the next
+    step propagates an isotropic covariance. The default (False) propagates the full anisotropic
+    Sigma and leaves the isotropic approximation to isotropic_block_sigmas at the end (paper eq. 23).
     Returns the 9x9 Sigma_ij, blocks ordered [dphi(0:3), dv(3:6), dp(6:9)].
     """
     gyro = np.asarray(gyro, float).reshape(-1, 3)
@@ -131,6 +146,8 @@ def preintegrate_covariance(gyro, acc, dt, bgbar, babar, sig_g, sig_a, iso_input
         Seta[3:6, 3:6] = I3 * (sig_a ** 2 / h)
 
         Sig = A @ Sig @ A.T + B @ Seta @ B.T
+        if iso_propagate:
+            Sig = iso_project(Sig)
         dR = dR @ Ck
     return 0.5 * (Sig + Sig.T)
 
@@ -332,14 +349,19 @@ def compute_weights(gyro_sigma, accel_sigma, T_seg, mode='unit',
 # --------------------------------------------------------------------------- #
 # Cost (eq 23-27, single bias) + scalar priors
 # --------------------------------------------------------------------------- #
-def build_cost_matrix(layout, edges, scalar_priors=None, rw_pairs=None):
-    """scalar_priors: list of (idx, ref, tau) adding tau (x_idx - ref s)^2.
+def residual_matrix(layout, edges, scalar_priors=None, rw_pairs=None):
+    """B such that the cost is ||B x||^2 = x^T Q x: every whitened residual row, unsquared.
 
-    rw_pairs: list of (m, m+1, tau_g, tau_a) adding the phi^RW between-factors
-    tau_g ||b^g_{m+1} - b^g_m||^2 + tau_a ||b^a_{m+1} - b^a_m||^2. These are the only terms coupling
-    distinct bias blocks; with one block the list is empty and the cost is unchanged.
+    Rows: per edge the 9 rotation, 3 velocity and 3 position residuals (eq 23-27); one row per
+    bias component per phi^RW between-factor; one row per scalar prior (idx, ref, tau), which
+    adds sqrt(tau) (x_idx - ref s). Keeping B (rather than only Q = B^T B) is what lets the
+    solver centre the problem (see solve_cayley_sdp) and lets rank_and_gap evaluate the rounded
+    cost as ||B x||^2 without the cancellation of x^T Q x.
+
+    NB: the rotation residual uses the noiseless-form R_j - R_i dRt - (Y+Y')/2 with the bias
+    correction folded into Y, Y' via the lifting; b^g enters only through the constraints.
     """
-    n = layout.n; Q = np.zeros((n, n))
+    n = layout.n; rows = []
     for e, ed in enumerate(edges):
         i, j = ed.i, ed.j; dt = ed.dt_ij
         tR, tv, tp = np.sqrt(ed.tauR), np.sqrt(ed.tauv), np.sqrt(ed.taup)
@@ -362,25 +384,126 @@ def build_cost_matrix(layout, edges, scalar_priors=None, rw_pairs=None):
         B[12:15, layout.si] = -tp * 0.5 * GRAVITY * dt * dt
         B[12:15, layout.R0 + 9 * i:layout.R0 + 9 * (i + 1)] = -tp * np.kron(ed.pbr.reshape(1, 3), I3)
         B[12:15, layout.Zp0 + 3 * e:layout.Zp0 + 3 * e + 3] = -tp * I3
-        Q += B.T @ B
-    # NB: the rotation residual here uses the noiseless-form R_j - R_i dRt - (Y+Y')/2 with the
-    # bias correction folded into Y,Y' via the lifting; b^g enters only through the constraints.
+        rows.append(B)
     for m0, m1, tau_g, tau_a in (rw_pairs or []):
         for idx_f, tau in ((layout.bg, tau_g), (layout.ba, tau_a)):
             if tau <= 0:
                 continue
             for c in range(3):
-                a, b = idx_f(m0, c), idx_f(m1, c)
-                Q[a, a] += tau; Q[b, b] += tau
-                Q[a, b] -= tau; Q[b, a] -= tau
+                r = np.zeros((1, n)); r[0, idx_f(m1, c)] = np.sqrt(tau); r[0, idx_f(m0, c)] = -np.sqrt(tau)
+                rows.append(r)
     for idx, ref, tau in (scalar_priors or []):
         if tau <= 0:
             continue
-        ref = float(ref)
-        Q[idx, idx] += tau
-        Q[idx, layout.si] += -tau * ref; Q[layout.si, idx] += -tau * ref
-        Q[layout.si, layout.si] += tau * ref * ref
-    return Q
+        r = np.zeros((1, n)); r[0, idx] = np.sqrt(tau); r[0, layout.si] = -np.sqrt(tau) * float(ref)
+        rows.append(r)
+    return np.vstack(rows) if rows else np.zeros((0, n))
+
+
+def build_cost_matrix(layout, edges, scalar_priors=None, rw_pairs=None):
+    """Q = B^T B (see residual_matrix).
+
+    scalar_priors: list of (idx, ref, tau) adding tau (x_idx - ref s)^2.
+    rw_pairs: list of (m, m+1, tau_g, tau_a) adding the phi^RW between-factors
+    tau_g ||b^g_{m+1} - b^g_m||^2 + tau_a ||b^a_{m+1} - b^a_m||^2. These are the only terms coupling
+    distinct bias blocks; with one block the list is empty and the cost is unchanged.
+    """
+    B = residual_matrix(layout, edges, scalar_priors=scalar_priors, rw_pairs=rw_pairs)
+    return B.T @ B
+
+
+def lift_solution(layout, edges, R, v, p, bg, ba):
+    """Homogenised x = [vec R, v, p, b, vec Y, vec Y', Z^v, Z^p, 1] from (R, v, p, b). The lifting
+    variables are recomputed from R and b, so x is exactly QCQP-feasible when every R is in SO(3)."""
+    x = np.zeros(layout.n)
+    for k in range(layout.N):
+        x[layout.R0 + 9 * k:layout.R0 + 9 * (k + 1)] = np.asarray(R[k]).flatten('F')
+        x[layout.v(k, 0):layout.v(k, 0) + 3] = v[k]; x[layout.p(k, 0):layout.p(k, 0) + 3] = p[k]
+    bg = np.atleast_2d(bg); ba = np.atleast_2d(ba)
+    for m in range(layout.M):
+        x[layout.bg(m, 0):layout.bg(m, 0) + 3] = bg[m]
+        x[layout.ba(m, 0):layout.ba(m, 0) + 3] = ba[m]
+    for e, ed in enumerate(edges):
+        vv = ed.JR @ bg[ed.blk]
+        x[layout.Y0 + 9 * e:layout.Y0 + 9 * (e + 1)] = (R[ed.i] @ ed.dRt @ skew(vv)).flatten('F')
+        x[layout.Yp0 + 9 * e:layout.Yp0 + 9 * (e + 1)] = (R[ed.j] @ skew(vv)).flatten('F')
+        x[layout.Zv(e, 0):layout.Zv(e, 0) + 3] = R[ed.i] @ (ed.Avg @ bg[ed.blk] + ed.Ava @ ba[ed.blk])
+        x[layout.Zp(e, 0):layout.Zp(e, 0) + 3] = R[ed.i] @ (ed.Apg @ bg[ed.blk] + ed.Apa @ ba[ed.blk])
+    x[layout.si] = 1.0
+    return x
+
+
+def wahba_R0(layout, edges, scalar_priors):
+    """R_0 from the GNSS priors and the IMU alone (no anchor), by Wahba's problem -> (R_0, sv).
+
+    Every inertial edge predicts the world-frame velocity and position increments from body-frame
+    pre-integrated ones, rotated by R_i = R_0 C_i with C_i the chained Delta R (body 0 -> i):
+
+        a_e = vbar_j - vbar_i - g dt                     ~  R_0 (C_i dv_e)  = R_0 b_e
+        c_e = pbar_j - pbar_i - vbar_i dt - g dt^2 / 2   ~  R_0 (C_i dp_e)  = R_0 d_e
+
+    with vbar, pbar the GNSS velocity/position priors. R_0 = argmin_R sum tau_v ||a - R b||^2 +
+    tau_p ||c - R d||^2 over SO(3) is Wahba's problem; its closed-form solution is the SVD of
+    H = sum tau_v a b^T + tau_p c d^T: H = U S V^T, R_0 = U diag(1, 1, det(U V^T)) V^T.
+
+    sv (the singular values of H) is an observability read-out: gravity alone makes H rank one
+    (tilt only), so sv[1]/sv[0] ~ 0 means yaw is unobservable on this window and R_0's yaw is
+    arbitrary -- harmless for centring, since the cost is then flat in yaw too.
+    Returns (None, None) unless every node carries both a velocity and a position prior.
+    """
+    ref = {idx: r for idx, r, tau in (scalar_priors or []) if tau > 0}
+    try:
+        vb = [np.array([ref[layout.v(k, c)] for c in range(3)]) for k in range(layout.N)]
+        pb = [np.array([ref[layout.p(k, c)] for c in range(3)]) for k in range(layout.N)]
+    except KeyError:
+        return None, None
+    H = np.zeros((3, 3)); Ci = np.eye(3)
+    for ed in edges:
+        i, j, dt = ed.i, ed.j, ed.dt_ij
+        a = vb[j] - vb[i] - GRAVITY * dt
+        c = pb[j] - pb[i] - vb[i] * dt - 0.5 * GRAVITY * dt * dt
+        H += ed.tauv * np.outer(a, Ci @ ed.dvt) + ed.taup * np.outer(c, Ci @ ed.dpt)
+        Ci = Ci @ ed.dRt
+    U, S, Vt = np.linalg.svd(H)
+    return U @ np.diag([1.0, 1.0, np.sign(np.linalg.det(U @ Vt))]) @ Vt, S
+
+
+def reference_point(layout, edges, anchors, scalar_priors, info=None):
+    """A-priori centring point xbar for solve_cayley_sdp, or None if there is no rotation reference.
+
+    R_0 from the hard anchor (gauge 'R' / True), else its soft prior ('R_prior'), else -- free
+    gauge -- from wahba_R0 (GNSS priors + IMU); R_k by chaining the pre-integrated Delta R; v_k,
+    p_k from the GNSS priors (node-0 anchors where present); every bias block at the phi^B
+    reference. Nothing here uses the SDP solution or the ground truth beyond what the problem
+    already contains as measurements/anchors. The certificate does not depend on xbar at all
+    (the congruence is exact for any xbar); xbar only sets how well conditioned the solve is.
+    info (dict), if given, receives the source of R_0 and, for Wahba, its singular values.
+    """
+    ref = {idx: r for idx, r, tau in (scalar_priors or []) if tau > 0}
+    info = {} if info is None else info
+    if anchors and 'R0' in anchors:
+        R0 = np.asarray(anchors['R0'], float); info['R0_source'] = 'anchor'
+    elif all(layout.R(0, r, c) in ref for r in range(3) for c in range(3)):
+        R0 = project_to_so3(np.array([[ref[layout.R(0, r, c)] for c in range(3)] for r in range(3)]))
+        info['R0_source'] = 'R_prior'
+    else:
+        R0, sv = wahba_R0(layout, edges, scalar_priors)
+        if R0 is None:
+            return None
+        info.update(R0_source='wahba', R0_ref=R0, wahba_sv=[float(x) for x in sv])
+    R = [R0]
+    for ed in edges:
+        R.append(R[-1] @ ed.dRt)
+
+    def vec(f, k, key):
+        if anchors and key in anchors and k == 0:
+            return np.asarray(anchors[key], float)
+        return np.array([ref.get(f(k, c), 0.0) for c in range(3)])
+    v = [vec(layout.v, k, 'v0') for k in range(layout.N)]
+    p = [vec(layout.p, k, 'p0') for k in range(layout.N)]
+    bg = np.array([[ref.get(layout.bg(0, c), 0.0) for c in range(3)]] * layout.M)
+    ba = np.array([[ref.get(layout.ba(0, c), 0.0) for c in range(3)]] * layout.M)
+    return lift_solution(layout, edges, R, v, p, bg, ba)
 
 
 # --------------------------------------------------------------------------- #
@@ -521,36 +644,116 @@ def _C2(lay, ed, e, add, pos):
 # --------------------------------------------------------------------------- #
 # Solve / extract
 # --------------------------------------------------------------------------- #
+CONDITIONINGS = ('centre_whiten', None)
+
+
+def _condition(layout, edges, anchors, scalar_priors, B, info=None):
+    """Centre-and-whiten change of variables x = T x_t -> (d, xbar), or None if not applicable.
+
+        x_i = d_i x_t_i + xbar_i s   (i != s),     x_s = x_t_s
+
+    xbar is reference_point(); d_i = 1/sqrt(Q_c[i,i]) whitens every coordinate of the centred
+    cost Q_c = (B T_c)^T (B T_c). Centring is the part that matters: it turns the s-column of B
+    into the residual at xbar, so Q_t[s,s] = f(xbar) instead of a sum of tau * ref^2 terms that
+    cancel to f* (4.7e9 -> 4.5e2 on synthetic sick at sigma = 1e-3). Whitening then brings the
+    remaining curvature (tau_R ~ 1e7, tau_bg ~ 1e8) to O(1). Whitening WITHOUT centring is
+    harmful (it shrinks everything around the uncancelled s-s entry) and is not offered.
+    """
+    xbar = reference_point(layout, edges, anchors, scalar_priors, info=info)
+    if xbar is None:
+        return None
+    s = layout.si; xbar = xbar.copy(); xbar[s] = 0.0
+    col = B @ xbar + B[:, s]
+    dq = np.sqrt(np.einsum('ij,ij->j', B, B)); dq[s] = 0.0
+    d = np.ones(layout.n); ok = dq > 0; d[ok] = 1.0 / dq[ok]
+    Bt = B * d[None, :]; Bt[:, s] = col
+    return d, xbar, Bt
+
+
 def solve_cayley_sdp(layout, edges, anchors, scalar_priors=None, add_redundant=True,
                      obj_scale=1.0, solver_params=None, accept_any=False, diag=None,
-                     rw_pairs=None):
-    """obj_scale multiplies Q *only* for the solver. The constraints are untouched and the cone is
-    scale-invariant, so argmin and Z* are mathematically unchanged -- it exists purely to keep the
-    objective inside MOSEK's tolerance band. Returned sdp_opt is de-scaled to the true Q units.
+                     rw_pairs=None, conditioning='centre_whiten'):
+    """Shor relaxation min <Q,Z> s.t. <A_i,Z> = b_i, Z >= 0, solved by MOSEK (interior point).
 
-    'auto' targets max|Q| ~ 1e4: raw inverse-covariance weights push max|Q| to ~1e8 (MOSEK then
-    reports ProblemStatus.Unknown), while dividing by the max weight drives the objective to ~1e-7,
-    below MOSEK's absolute tolerance, which silently costs ~19% on the optimum. Never scales up.
+    conditioning='centre_whiten' (default) solves the SAME relaxation after the exact congruence
+    Z = T Z_t T^T of _condition: feasible sets are in bijection and rank and optimum are
+    unchanged, but the data MOSEK sees is O(1)-O(1e4) instead of ~1e9 with a cancelling objective.
+    Each transformed constraint row has its Z_t[s,s] coefficient folded into the right-hand side
+    (Z_t[s,s] = 1 is itself a constraint) and is normalised to unit max coefficient. On the K = 8
+    A/B (cayley_conditioning.py) this certifies every window at eta <= 1.3e-8 with no objective
+    scaling, against eta up to 3e-3 for the scalar obj_scale='auto'. The rotation reference comes
+    from the anchor (gauge 'R' / True), the R_0 prior ('R_prior'), or, under the free gauge, from
+    wahba_R0; it falls back to None only if there is no anchor and no full set of GNSS priors.
+
+    conditioning=None is the legacy formulation: Q as built, with obj_scale only for the solver.
+    'auto' then targets max|Q| ~ 1e4 -- raw inverse-covariance weights push max|Q| to ~1e8 (MOSEK
+    reports ProblemStatus.Unknown), while dividing by the max weight drives the objective below
+    MOSEK's absolute tolerance. Never scales up. obj_scale also multiplies Q_t when conditioned,
+    but 1.0 is the intended setting there.
+
+    Returns (Z in the original coordinates, Q, p*). diag (if given) receives solsta, prosta,
+    conditioning, obj_scale, qmax (raw Q) and qmax_solver, the dual bound dual_lb with
+    lmin_S = lambda_min(S), S = Q_t - sum y_m A_m (de-scaled), and '_cond' for rank_and_gap.
+    dual_lb = b^T y + min(0, lambda_min(S)) tr(Z_t): a lower bound on p* that does not depend on
+    the primal value <Q,Z>, which an interior-point method can return slightly too high.
     """
-    Q = build_cost_matrix(layout, edges, scalar_priors=scalar_priors, rw_pairs=rw_pairs)
+    if conditioning not in CONDITIONINGS:
+        raise ValueError("conditioning must be one of %r, got %r" % (CONDITIONINGS, conditioning))
+    n = layout.n; s = layout.si
+    B = residual_matrix(layout, edges, scalar_priors=scalar_priors, rw_pairs=rw_pairs)
+    Q = B.T @ B
+    rinfo = {}
+    tr = _condition(layout, edges, anchors, scalar_priors, B, info=rinfo) if conditioning else None
+    used = conditioning if tr is not None else None
+    if tr is not None:
+        d, xbar, Bt = tr; Qt = Bt.T @ Bt
+    else:
+        d, xbar, Qt = np.ones(n), np.zeros(n), Q
+    qmax_t = float(np.abs(Qt).max())
     if isinstance(obj_scale, str):
         if obj_scale != 'auto':
             raise ValueError("obj_scale must be a positive float or 'auto', got %r" % obj_scale)
-        qmax = float(np.abs(Q).max())
-        obj_scale = min(1.0, 1e4 / qmax) if qmax > 0 else 1.0
-    Qs = Q * float(obj_scale)
+        obj_scale = min(1.0, 1e4 / qmax_t) if qmax_t > 0 else 1.0
+    sc = float(obj_scale)
+    # row a of T: (a, d_a) and (s, xbar_a); row s: (s, 1)
+    Trow = ([((a, d[a]), (s, xbar[a])) if a != s else ((s, 1.0),) for a in range(n)]
+            if used else None)
+    trip_r, trip_c, trip_v, trip_k, rhs_l, cons = [], [], [], [], [], []
     with Model('cayley_sdp') as M:
-        Z = M.variable('Z', Domain.inPSDCone(layout.n))
-        M.objective(ObjectiveSense.Minimize, Expr.dot(Qs.tolist(), Z))
+        Z = M.variable('Z', Domain.inPSDCone(n))
+        M.objective(ObjectiveSense.Minimize, Expr.dot((Qt * sc).tolist(), Z))
+
+        def put(dct, rhs):
+            k = len(cons)
+            ex = [Expr.mul(v, Z.index(a, b)) for (a, b), v in dct.items()]
+            cons.append(M.constraint(Expr.add(ex) if len(ex) > 1 else ex[0],
+                                     Domain.equalsTo(float(rhs))))
+            for (a, b), v in dct.items():
+                trip_r.append(a); trip_c.append(b); trip_v.append(v); trip_k.append(k)
+            rhs_l.append(float(rhs))
 
         def add(terms, rhs=0.0):
-            d = {}
+            dct = {}
+            if used is None or (len(terms) == 1 and terms[0][1] == s and terms[0][2] == s):
+                for c, a, b in terms:          # untransformed (also the s^2 = 1 row)
+                    a, b = (a, b) if a <= b else (b, a)
+                    dct[(a, b)] = dct.get((a, b), 0.0) + float(c)
+                dct = {k: v for k, v in dct.items() if abs(v) > 1e-14}
+                if dct:
+                    put(dct, rhs)
+                return
             for c, a, b in terms:
-                a, b = (a, b) if a <= b else (b, a)
-                d[(a, b)] = d.get((a, b), 0.0) + float(c)
-            ex = [Expr.mul(v, Z.index(a, b)) for (a, b), v in d.items() if abs(v) > 1e-14]
-            if ex:
-                M.constraint(Expr.add(ex) if len(ex) > 1 else ex[0], Domain.equalsTo(float(rhs)))
+                for k, ta in Trow[a]:
+                    for l, tb in Trow[b]:
+                        co = float(c) * ta * tb
+                        if co != 0.0:
+                            key = (k, l) if k <= l else (l, k)
+                            dct[key] = dct.get(key, 0.0) + co
+            rhs = float(rhs) - dct.pop((s, s), 0.0)          # fold: Z_t[s,s] = 1
+            mx = max([abs(v) for v in dct.values()] + [0.0])
+            if mx == 0.0:
+                return
+            put({k: v / mx for k, v in dct.items() if abs(v) > 1e-13 * mx}, rhs / mx)
 
         _constraints(layout, edges, anchors, add, redundant=add_redundant)
         for k, v in (solver_params or {}).items():
@@ -560,15 +763,41 @@ def solve_cayley_sdp(layout, edges, anchors, scalar_priors=None, add_redundant=T
         M.solve()
         solsta = str(M.getPrimalSolutionStatus()); prosta = str(M.getProblemStatus())
         if diag is not None:
-            diag.update(solsta=solsta, prosta=prosta, obj_scale=float(obj_scale),
-                        qmax=float(np.abs(Q).max()))
+            diag.update(solsta=solsta, prosta=prosta, conditioning=used, obj_scale=sc,
+                        qmax=float(np.abs(Q).max()), qmax_solver=qmax_t * sc,
+                        R0_source=rinfo.get('R0_source'), wahba_sv=rinfo.get('wahba_sv'))
         if 'Optimal' not in solsta and not accept_any:
             return None, Q, prosta
         try:
-            Zo = np.array(Z.level()).reshape(layout.n, layout.n)
+            Zt = np.array(Z.level()).reshape(n, n)
         except Exception as exc:
             return None, Q, '%s / no level (%s)' % (prosta, type(exc).__name__)
-        return Zo, Q, float(np.sum(Q * Zo))
+        try:
+            y = np.array([float(np.asarray(c.dual()).ravel()[0]) for c in cons])
+        except Exception:
+            y = None
+    pstar = float(np.sum(Qt * Zt))
+    if diag is not None:
+        dual_lb = lmin = None
+        if y is not None:
+            # sum_m y_m A_m with A_m symmetric and <A_m, Z> = sum v Z[a,b] over a <= b
+            r_, c_, v_ = np.array(trip_r), np.array(trip_c), np.array(trip_v) * y[np.array(trip_k)]
+            YA = np.zeros((n, n))
+            dg = r_ == c_
+            np.add.at(YA, (r_[dg], c_[dg]), v_[dg])
+            np.add.at(YA, (r_[~dg], c_[~dg]), 0.5 * v_[~dg]); np.add.at(YA, (c_[~dg], r_[~dg]), 0.5 * v_[~dg])
+            by = float(np.dot(y, rhs_l)); trZ = float(np.trace(Zt))
+            for sgn in (1.0, -1.0):        # MOSEK's dual sign convention, picked by lambda_min
+                lm = float(np.linalg.eigvalsh(sc * Qt - sgn * YA)[0])
+                if lmin is None or lm > lmin:
+                    lmin, dual_lb = lm, sgn * by + min(0.0, lm) * trZ
+            lmin, dual_lb = lmin / sc, dual_lb / sc
+        diag.update(dual_lb=dual_lb, lmin_S=lmin, pstar=pstar,
+                    _cond=dict(B=B, pstar=pstar) if used else None)
+    if used:
+        T = np.diag(d); T[:, s] += xbar
+        return T @ Zt @ T.T, Q, pstar
+    return Zt, Q, pstar
 
 
 def extract_solution(Z, layout):
@@ -583,25 +812,17 @@ def extract_solution(Z, layout):
     return R, v, p, bg, ba
 
 
-def rank_and_gap(Q, Z, layout, edges, R, v, p, bg, ba):
+def rank_and_gap(Q, Z, layout, edges, R, v, p, bg, ba, cond=None):
+    """cond (diag['_cond'] from a conditioned solve) supplies B and the solver-coordinate p*, so
+    that f_hat = ||B x_hat||^2 and p* = <Q_t, Z_t> are evaluated without the cancellation that
+    x^T Q x and <Q, Z> suffer when max|Q| ~ 1e9 and f* ~ 1."""
     w = np.sort(np.linalg.eigvalsh((Z + Z.T) / 2))[::-1]
     rank = int(np.sum(w > 1e-6 * max(1.0, w.max())))
-    x = np.zeros(layout.n)
-    for k in range(layout.N):
-        x[layout.R0 + 9 * k:layout.R0 + 9 * (k + 1)] = R[k].flatten('F')
-        x[layout.v(k, 0):layout.v(k, 0) + 3] = v[k]; x[layout.p(k, 0):layout.p(k, 0) + 3] = p[k]
-    bg = np.atleast_2d(bg); ba = np.atleast_2d(ba)
-    for m in range(layout.M):
-        x[layout.bg(m, 0):layout.bg(m, 0) + 3] = bg[m]
-        x[layout.ba(m, 0):layout.ba(m, 0) + 3] = ba[m]
-    for e, ed in enumerate(edges):
-        vv = ed.JR @ bg[ed.blk]
-        x[layout.Y0 + 9 * e:layout.Y0 + 9 * (e + 1)] = (R[ed.i] @ ed.dRt @ skew(vv)).flatten('F')
-        x[layout.Yp0 + 9 * e:layout.Yp0 + 9 * (e + 1)] = (R[ed.j] @ skew(vv)).flatten('F')
-        x[layout.Zv(e, 0):layout.Zv(e, 0) + 3] = R[ed.i] @ (ed.Avg @ bg[ed.blk] + ed.Ava @ ba[ed.blk])
-        x[layout.Zp(e, 0):layout.Zp(e, 0) + 3] = R[ed.i] @ (ed.Apg @ bg[ed.blk] + ed.Apa @ ba[ed.blk])
-    x[layout.si] = 1.0
-    rounded = float(x @ Q @ x); sdp_opt = float(np.sum(Q * Z))
+    x = lift_solution(layout, edges, R, v, p, bg, ba)
+    if cond is not None:
+        rounded = float(np.sum((cond['B'] @ x) ** 2)); sdp_opt = float(cond['pstar'])
+    else:
+        rounded = float(x @ Q @ x); sdp_opt = float(np.sum(Q * Z))
     # NB: the (1 + |rounded|) denominator is NOT scale invariant -- rescaling all weights by c
     # shrinks it. rel_gap divides by |rounded| alone, so it is comparable across weightings.
     gap = (rounded - sdp_opt) / (1.0 + abs(rounded))
@@ -617,6 +838,15 @@ def rank_and_gap(Q, Z, layout, edges, R, v, p, bg, ba):
     lam2 = max(float(w[1]), 1e-300) if w.size > 1 else 1e-300
     log_svr = float(np.log10(max(float(w[0]), 1e-300) / lam2))
     return rank, sdp_opt, rounded, gap, rel_gap, eta, log_svr
+
+
+def _dual_fields(dg, rounded):
+    """Dual-bound certificate fields for a runner's result dict."""
+    lb = dg.get('dual_lb')
+    return dict(dual_lb=lb, lmin_S=dg.get('lmin_S'), conditioning=dg.get('conditioning'),
+                solsta=dg.get('solsta'), prosta=dg.get('prosta'), R0_source=dg.get('R0_source'),
+                wahba_sv=dg.get('wahba_sv'),
+                eta_dual=None if lb is None else (rounded - lb) / (1.0 + abs(rounded) + abs(lb)))
 
 
 def _rot_err(R_est, R_true):
@@ -673,6 +903,12 @@ def _recenter(p_t):
 
 def _gauge(gauge_fix, R_t, v_t, p_t, R0_prior_sigma=None):
     """gauge_fix -> (anchors dict or None, first prior node, R_0 soft prior or None).
+
+    Default everywhere is 'R'. With False, yaw is unobservable whenever the window is near
+    stationary (the velocity priors are ~0 and there is no horizontal acceleration): UrbanNav
+    medium@40 s and deep@90 s then certify at rank 1 with 72-82 deg of pure yaw error, and moving
+    windows still carry 1-3 deg. Note 'R' pins tilt as well, which gravity already observes, so
+    it acts as an infinitely precise attitude measurement rather than a pure gauge fix.
 
     False     -- no hard anchor at all; GNSS v/p priors on every node (first_node=0). The window is
                  held only by those priors, so the rotation gauge rests on gravity plus the
@@ -735,10 +971,10 @@ def _build_scalar_priors(layout, v_ref, p_ref, bgbar, babar, w, first_node=1, R0
 def run_synthetic(scenario_name='sick', T=6.0, dt=0.01, kf_interval=1.0, accel_sigma=1e-3,
                   gyro_sigma=1e-3, add_redundant=True, seed=0, weight_mode='unit',
                   prior_sigmas=(0.1, 0.05, 1e-2, 1e-2), obj_scale=1.0, noise_sigma=None,
-                  iso_input=False, iso_reduce='max', bias_prior_rw=True,
+                  iso_input=False, iso_reduce='max', bias_prior_rw=True, iso_propagate=False,
                   max_bias_precision=None, rot_chordal=True, gt_from_clean=True,
-                  gauge_fix=True, R0_prior_sigma=None, kf_per_bias=None,
-                  gyro_rw=1.9393e-5, accel_rw=3.0e-3,
+                  gauge_fix='R', R0_prior_sigma=None, kf_per_bias=None,
+                  gyro_rw=1.9393e-5, accel_rw=3.0e-3, conditioning='centre_whiten',
                   solver_params=None, accept_any=False, diag=None):
     ang, lin = build_scenarios()[scenario_name]
     scenario = gtsam.ConstantTwistScenario(ang, lin)
@@ -773,7 +1009,8 @@ def run_synthetic(scenario_name='sick', T=6.0, dt=0.01, kf_interval=1.0, accel_s
         for e, ed in enumerate(edges):
             sl = slice(e * spe, (e + 1) * spe)
             Sig = preintegrate_covariance(gyro[sl], acc[sl], dt, bgbar, babar,
-                                          nd_g, nd_a, iso_input=iso_input)
+                                          nd_g, nd_a, iso_input=iso_input,
+                                          iso_propagate=iso_propagate)
             sR, sv, sp = isotropic_block_sigmas(Sig, reduce=iso_reduce)
             ed.tauR, ed.tauv, ed.taup = 1.0 / (cR * sR), 1.0 / sv, 1.0 / sp
         bdt = float(T)
@@ -799,15 +1036,17 @@ def run_synthetic(scenario_name='sick', T=6.0, dt=0.01, kf_interval=1.0, accel_s
     anchors, first_node, R0_prior = _gauge(gauge_fix, R_t, v_t, p_t, R0_prior_sigma)
     priors = _build_scalar_priors(lay, v_t, p_t, bgbar, babar, w, first_node=first_node,
                                   R0_prior=R0_prior)
+    dg = {} if diag is None else diag
     Z, Q, info = solve_cayley_sdp(lay, edges, anchors, scalar_priors=priors,
                                   add_redundant=add_redundant, obj_scale=obj_scale,
-                                  solver_params=solver_params, accept_any=accept_any, diag=diag,
-                                  rw_pairs=rw_pairs)
+                                  solver_params=solver_params, accept_any=accept_any, diag=dg,
+                                  rw_pairs=rw_pairs, conditioning=conditioning)
     if Z is None:
         return dict(status=info, rank=None)
     R, v, p, bg, ba = extract_solution(Z, lay)
-    rank, sdp_opt, rounded, gap, rel_gap, eta, log_svr = rank_and_gap(Q, Z, lay, edges, R, v, p, bg, ba)
-    return dict(status='ok', rank=rank, sdp_opt=sdp_opt, gap=gap, rel_gap=rel_gap, eta=eta, log_svr=log_svr, rounded=rounded, rot_err=_rot_err(R, R_t),
+    rank, sdp_opt, rounded, gap, rel_gap, eta, log_svr = rank_and_gap(Q, Z, lay, edges, R, v, p, bg, ba,
+                                                                      cond=dg.pop('_cond', None))
+    return dict(status='ok', **_dual_fields(dg, rounded), rank=rank, sdp_opt=sdp_opt, gap=gap, rel_gap=rel_gap, eta=eta, log_svr=log_svr, rounded=rounded, rot_err=_rot_err(R, R_t),
                 bg=bg, ba=ba, num_bias=M, kf_per_bias=kf_per_bias, n_var=lay.n,
                 bias_err_per_block=[float(np.linalg.norm(np.r_[bg[m] - bgbar, ba[m] - babar]))
                                     for m in range(M)],
@@ -818,12 +1057,26 @@ def run_synthetic(scenario_name='sick', T=6.0, dt=0.01, kf_interval=1.0, accel_s
 
 def run_euroc(base, T=12.0, kf_interval=1.0, t_start=0.5, add_redundant=True,
               gyro_nd=1.6968e-4, accel_nd=2.0e-3, noise_sigma=0.0, seed=0,
-              weight_mode='dataset', prior_sigmas=(0.1, 0.05, 1e-2, 1e-2), gauge_fix=False,
+              weight_mode='dataset', prior_sigmas=(0.1, 0.05, 1e-2, 1e-2), gauge_fix='R',
               R0_prior_sigma=None, recenter=True, kf_per_bias=None,
               gyro_rw=1.9393e-5, accel_rw=3.0e-3, obj_scale=1.0, rot_chordal=True,
               iso_input=False, bias_prior_rw=True, bias_interval=None,
-              max_bias_precision=None, iso_reduce='max',
-              solver_params=None, accept_any=False, diag=None):
+              max_bias_precision=None, iso_reduce='max', iso_propagate=False,
+              conditioning='centre_whiten', solver_params=None, accept_any=False, diag=None,
+              gnss_seed=None, bias_init='gt'):
+    """GNSS-IMU smoothing over one EuRoC window.
+
+    By default the GNSS priors are the ground-truth velocity/position and the bias linearisation
+    point is the ground-truth bias at the window start (the paper's setting). For a run that uses
+    no ground truth at all beyond what a GNSS receiver would report:
+      gnss_seed -- corrupt the v/p references with N(0, prior_sigmas[0/1]) noise, drawn by
+                   `simulate_gnss` (so a baseline can reproduce the exact same measurements);
+      bias_init -- linearisation point and prior mean for the bias: 'gt' (default), 'zero', or
+                   an explicit (bg, ba), e.g. a calibration from another sequence. Pair a non-'gt'
+                   value with bias_prior_rw=False and prior_sigmas[2:] set to its uncertainty.
+                   Note the relaxation is only tight with an informative bias prior: broad ones
+                   (0.05 rad/s, 0.3 m/s^2) give rank > 100 even at the true bias.
+    """
     imu = np.loadtxt(f"{base}/imu0/data.csv", delimiter=",", skiprows=1)
     gt = np.loadtxt(f"{base}/state_groundtruth_estimate0/data.csv", delimiter=",", skiprows=1)
     it = imu[:, 0].astype(np.int64); gyro_all = imu[:, 1:4].copy(); acc_all = imu[:, 4:7].copy()
@@ -838,6 +1091,13 @@ def run_euroc(base, T=12.0, kf_interval=1.0, t_start=0.5, add_redundant=True,
 
     def gnearest(ts): return int(np.argmin(np.abs(gt_t - ts)))
     g0 = gnearest(t0); bgbar = bw[g0].copy(); babar = ba_[g0].copy()
+    bg_true, ba_true = bgbar.copy(), babar.copy()
+    if isinstance(bias_init, str) and bias_init == 'zero':
+        bgbar = np.zeros(3); babar = np.zeros(3)
+    elif not isinstance(bias_init, str):
+        bgbar = np.asarray(bias_init[0], float).copy(); babar = np.asarray(bias_init[1], float).copy()
+    elif bias_init != 'gt':
+        raise ValueError("bias_init must be 'gt', 'zero' or (bg, ba); got %r" % (bias_init,))
 
     def Rgt(ts):
         q = quat[gnearest(ts)]; return project_to_so3(np.asarray(gtsam.Rot3.Quaternion(q[0], q[1], q[2], q[3]).matrix()))
@@ -878,7 +1138,8 @@ def run_euroc(base, T=12.0, kf_interval=1.0, t_start=0.5, add_redundant=True,
         pbr = pre['dp'] - pre['Apg'] @ bgbar - pre['Apa'] @ babar
         if weight_mode == 'dataset_cov':
             Sig = preintegrate_covariance(gyro_all[a:b], acc_all[a:b], dt, bgbar, babar,
-                                          nd_g, nd_a, iso_input=iso_input)
+                                          nd_g, nd_a, iso_input=iso_input,
+                                          iso_propagate=iso_propagate)
             sR, sv, sp = isotropic_block_sigmas(Sig, reduce=iso_reduce)
             cR = CHORDAL_ROT_FACTOR if rot_chordal else 1.0
             tR_e, tv_e, tp_e = 1.0 / (cR * sR), 1.0 / sv, 1.0 / sp
@@ -898,23 +1159,42 @@ def run_euroc(base, T=12.0, kf_interval=1.0, t_start=0.5, add_redundant=True,
     p_off = np.zeros(3)
     if recenter:
         p_t, p_off = _recenter(p_t)
+    v_m, p_m = v_t, p_t
+    if gnss_seed is not None:
+        v_m, p_m = simulate_gnss(v_t, p_t, prior_sigmas, gnss_seed)
     anchors, first_node, R0_prior = _gauge(gauge_fix, R_t, v_t, p_t, R0_prior_sigma)
-    priors = _build_scalar_priors(lay, v_t, p_t, bgbar, babar, w, first_node=first_node,
+    priors = _build_scalar_priors(lay, v_m, p_m, bgbar, babar, w, first_node=first_node,
                                   R0_prior=R0_prior)
+    dg = {} if diag is None else diag
     Z, Q, info = solve_cayley_sdp(lay, edges, anchors, scalar_priors=priors,
                                   add_redundant=add_redundant, obj_scale=obj_scale,
-                                  solver_params=solver_params, accept_any=accept_any, diag=diag,
-                                  rw_pairs=rw_pairs)
+                                  solver_params=solver_params, accept_any=accept_any, diag=dg,
+                                  rw_pairs=rw_pairs, conditioning=conditioning)
     if Z is None:
         return dict(status=info, rank=None)
     R, v, p, bg, ba = extract_solution(Z, lay)
-    rank, sdp_opt, rounded, gap, rel_gap, eta, log_svr = rank_and_gap(Q, Z, lay, edges, R, v, p, bg, ba)
-    return dict(status='ok', rank=rank, sdp_opt=sdp_opt, gap=gap, rel_gap=rel_gap, eta=eta, log_svr=log_svr, rounded=rounded, rot_err=_rot_err(R, R_t),
+    rank, sdp_opt, rounded, gap, rel_gap, eta, log_svr = rank_and_gap(Q, Z, lay, edges, R, v, p, bg, ba,
+                                                                      cond=dg.pop('_cond', None))
+    return dict(status='ok', **_dual_fields(dg, rounded), rank=rank, sdp_opt=sdp_opt, gap=gap, rel_gap=rel_gap, eta=eta, log_svr=log_svr, rounded=rounded, rot_err=_rot_err(R, R_t),
                 bg=bg, ba=ba, num_bias=M, kf_per_bias=kf_per_bias, n_var=lay.n,
-                bias_err_per_block=[float(np.linalg.norm(np.r_[bg[m] - bgbar, ba[m] - babar]))
+                bias_err_per_block=[float(np.linalg.norm(np.r_[bg[m] - bg_true, ba[m] - ba_true]))
                                     for m in range(M)],
+                bg_true=bg_true, ba_true=ba_true, bgbar=bgbar, babar=babar,
                 num_nodes=N, R_est=R, R_true=R_t, v_est=v, p_est=p, v_true=v_t, pos=p_t, kf=kf, gauge_fix=gauge_fix,
-                pos_offset=p_off)
+                v_meas=v_m, p_meas=p_m, pos_offset=p_off)
+
+
+def simulate_gnss(v_t, p_t, prior_sigmas, seed):
+    """GNSS velocity/position fixes: the true values plus N(0, sigma_v), N(0, sigma_p) noise.
+
+    One generator per seed, drawn in a fixed order (all velocities, then all positions), so any
+    baseline handed the same seed sees exactly the same measurements.
+    """
+    rng = np.random.default_rng(seed)
+    sv, sp = float(prior_sigmas[0]), float(prior_sigmas[1])
+    v_m = [np.asarray(v, float) + rng.normal(0.0, sv, 3) for v in v_t]
+    p_m = [np.asarray(p, float) + rng.normal(0.0, sp, 3) for p in p_t]
+    return v_m, p_m
 
 
 def run_urbannav(root, sequence='medium', T=8.0, kf_interval=1.0, t_start=6.0, add_redundant=True,
@@ -922,9 +1202,9 @@ def run_urbannav(root, sequence='medium', T=8.0, kf_interval=1.0, t_start=6.0, a
                  weight_mode='mle', prior_sigmas=(0.1, 0.05, 1e-2, 1e-2),
                  gyro_nd=None, accel_nd=None, gyro_rw=None, accel_rw=None,
                  obj_scale=1.0, rot_chordal=True, iso_input=False, bias_prior_rw=True,
-                 bias_interval=None, max_bias_precision=None, iso_reduce='max',
-                 solver_params=None, accept_any=False, diag=None,
-                 static_window=5.0, gravity=None, rate=None, gauge_fix=False,
+                 bias_interval=None, max_bias_precision=None, iso_reduce='max', iso_propagate=False,
+                 solver_params=None, accept_any=False, diag=None, conditioning='centre_whiten',
+                 static_window=5.0, gravity=None, rate=None, gauge_fix='R',
                  R0_prior_sigma=None, recenter=True, kf_per_bias=None):
     """UrbanNav (Hong Kong) twin of `run_euroc`.
 
@@ -1002,7 +1282,8 @@ def run_urbannav(root, sequence='medium', T=8.0, kf_interval=1.0, t_start=6.0, a
         pbr = pre['dp'] - pre['Apg'] @ bgbar - pre['Apa'] @ babar
         if weight_mode == 'dataset_cov':
             Sig = preintegrate_covariance(gyro_all[a:b], acc_all[a:b], dt, bgbar, babar,
-                                          nd_g, nd_a, iso_input=iso_input)
+                                          nd_g, nd_a, iso_input=iso_input,
+                                          iso_propagate=iso_propagate)
             sR, sv, sp = isotropic_block_sigmas(Sig, reduce=iso_reduce)
             cR = CHORDAL_ROT_FACTOR if rot_chordal else 1.0
             tR_e, tv_e, tp_e = 1.0 / (cR * sR), 1.0 / sv, 1.0 / sp
@@ -1028,16 +1309,18 @@ def run_urbannav(root, sequence='medium', T=8.0, kf_interval=1.0, t_start=6.0, a
     # Local gravity (9.7877 in Hong Kong) rather than the module default 9.81; the 0.24% difference
     # is the same order as the accelerometer bias, so it is not negligible for the velocity edges.
     with urbannav_data.override_gravity(sys.modules[__name__], g_local):
+        dg = {} if diag is None else diag
         Z, Q, info = solve_cayley_sdp(lay, edges, anchors, scalar_priors=priors,
                                       add_redundant=add_redundant, obj_scale=obj_scale,
-                                      solver_params=solver_params, accept_any=accept_any, diag=diag,
-                                      rw_pairs=rw_pairs)
+                                      solver_params=solver_params, accept_any=accept_any, diag=dg,
+                                      rw_pairs=rw_pairs, conditioning=conditioning)
         if Z is None:
             return dict(status=info, rank=None)
         R, v, p, bg, ba = extract_solution(Z, lay)
-        rank, sdp_opt, rounded, gap, rel_gap, eta, log_svr = rank_and_gap(Q, Z, lay, edges, R, v, p, bg, ba)
+        rank, sdp_opt, rounded, gap, rel_gap, eta, log_svr = rank_and_gap(Q, Z, lay, edges, R, v, p, bg, ba,
+                                                                      cond=dg.pop('_cond', None))
     speed = np.linalg.norm(np.asarray(v_t), axis=1)
-    return dict(status='ok', rank=rank, sdp_opt=sdp_opt, gap=gap, rel_gap=rel_gap, eta=eta, log_svr=log_svr, rounded=rounded,
+    return dict(status='ok', **_dual_fields(dg, rounded), rank=rank, sdp_opt=sdp_opt, gap=gap, rel_gap=rel_gap, eta=eta, log_svr=log_svr, rounded=rounded,
                 rot_err=_rot_err(R, R_t), num_nodes=N, R_est=R, R_true=R_t, v_est=v, p_est=p, v_true=v_t, pos=p_t, kf=kf,
                 pos_offset=p_off,
                 bg=bg, ba=ba, bgbar=bgbar, babar=babar, label=seq['label'],
@@ -1058,8 +1341,8 @@ if __name__ == "__main__":
     parser.add_argument("--sigma", type=float, default=1e-3)
     parser.add_argument("--weight-mode", type=str, default="dataset",
                         choices=["unit", "mle", "dataset", "dataset_raw", "dataset_cov"])
-    parser.add_argument("--gauge-fix", action="store_true",
-                        help="hard-anchor node 0 (legacy); default is priors on every node instead")
+    parser.add_argument("--gauge-fix", default="R", choices=["R", "free", "full"],
+                        help="R: hard-anchor R_0 (default); free: GNSS priors only; full: anchor R_0, v_0, p_0")
     parser.add_argument("--no-redundant", action="store_true")
     args = parser.parse_args()
 
@@ -1067,13 +1350,15 @@ if __name__ == "__main__":
     for k, v in check_preintegration_jacobians().items():
         print("  %-6s max|analytic-FD| = %.2e" % (k, v))
     red = not args.no_redundant
+    gfix = {'R': 'R', 'free': False, 'full': True}[args.gauge_fix]
     if args.euroc:
         r = run_euroc(args.euroc, T=args.T, kf_interval=args.kf, add_redundant=red,
-                      weight_mode=args.weight_mode, gauge_fix=args.gauge_fix)
+                      weight_mode=args.weight_mode, gauge_fix=gfix)
         tag = "EuRoC"
     else:
         r = run_synthetic(args.scenario, T=args.T, dt=args.dt, kf_interval=args.kf,
-                          accel_sigma=args.sigma, gyro_sigma=args.sigma, add_redundant=red, weight_mode=args.weight_mode)
+                          accel_sigma=args.sigma, gyro_sigma=args.sigma, add_redundant=red, weight_mode=args.weight_mode,
+                          gauge_fix=gfix)
         tag = "synthetic:%s" % args.scenario
     print("\n%s  redundant=%s  weights=%s" % (tag, red, args.weight_mode))
     if r['rank'] is None:
