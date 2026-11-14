@@ -1,70 +1,127 @@
 # A QCQP-Representable IMU Pre-Integration Factor for Certifiable State Estimation
 
+**Inertial navigation with a checkable global-optimality certificate.**
+
 [![arXiv](https://img.shields.io/badge/arXiv-2609.38048-b31b1b.svg)](https://arxiv.org/abs/2609.38048)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Reference implementation and replication code for the paper.
+**Utkarsh Rai · Zhexin Xu · Bang-Shien Chen · David Rosen**  
+Robust Autonomy Lab · Institute for Experiential Robotics · Northeastern University
 
-> Utkarsh Rai, Zhexin Xu, Bang-Shien Chen, and David Rosen.
-> *A QCQP-Representable IMU Pre-Integration Factor for Certifiable State Estimation.*
-> arXiv:2609.38048, 2026.
+[**Paper**](https://arxiv.org/abs/2609.38048) · [**Project & interactive demos**](https://ur10.github.io/projects/certifiable-imu/) · [**Method**](#method) · [**Results**](#experimental-results) · [**Quick start**](#quick-start) · [**Reproduce the paper**](#reproducing-the-paper)
 
-Standard IMU pre-integration builds its bias correction out of the exponential map, which has no
-exact polynomial form, so a pre-integrated inertial factor cannot be written as a QCQP and is
-therefore out of reach of certifiable estimation. This code replaces `Exp` with the **Cayley
-map**, which is a genuine retraction onto SO(3) *and* a ratio of polynomials: clearing its
-denominator leaves a residual of degree two. A catalog of closed-form **redundant constraints**
-on the resulting lifting variables then tightens the Shor relaxation to rank one, so the
-estimate comes with a certificate of global optimality.
+## Can we verify an inertial navigation estimate?
 
-In practice that means GNSS–IMU smoothing that needs **no initial guess**, and that tells you,
-per solve, whether the answer it returned is the global optimum.
+An inertial smoother can converge to a stationary point without establishing whether it has found the best explanation of its measurements. This matters when attitude initialization is poor: a plausible position trajectory can conceal a severely incorrect orientation.
 
-![LM from random attitudes vs one certified SDP solve](demos/figures/basins.png)
+We develop a **Cayley-based IMU preintegration factor that admits a quadratically constrained quadratic program (QCQP)**. Together with redundant constraints on its lifting variables, this enables a semidefinite relaxation that can recover and certify globally optimal solutions of the formulated estimation problem when the relaxation is tight.
 
-*EuRoC MH_04_difficult, one 16 s window, attitude unknown. Levenberg–Marquardt on the standard
-exp-map factor graph, started from 100 uniformly random attitudes, ends in a 158° mirror-image
-local minimum 11 times out of 100, and nothing in its output distinguishes those runs from the
-good ones. The Cayley SDP is solved once, without an initial guess, and certifies its answer
-(dual gap 6e-10). Reproduce: `python demos/basins.py && python demos/plot_basins.py`.*
+This repository contains the reference implementation, paper-reproduction scripts, and extended GNSS–IMU smoothing experiments. The central question is both computational and diagnostic: **can we recover a solution without a user-supplied trajectory initialization, and verify its optimality afterward?**
 
----
+![Sensitivity of local optimization to attitude initialization, compared with a certified Cayley SDP solution](demos/figures/basins.png)
 
-## Demos: the certified windows
+*One 16 s EuRoC MH_04_difficult window with no attitude prior. Standard exponential-map LM converges to an approximately 158° attitude-error solution in 11 of 100 random-attitude initializations. A single Cayley SDP solve returns a 0.1° attitude-error estimate with a reported relative dual gap of 6 × 10⁻¹⁰. These methods use the same measurements but different inertial formulations; the certificate applies to the Cayley objective.*
 
-Every demo poses the problem a GNSS–IMU system actually faces: GNSS velocity and position fixes
-on every keyframe (simulated from ground truth with 1 cm/s and 1 cm of noise, or 2 m and
-0.5 m/s while jammed) and raw IMU, with **no initial guess**. Levenberg–Marquardt on the standard exp-map
-factor graph (GTSAM) sees the identical measurements.
+## Research contributions
 
-A window counts as **certified** when the SDP solution has rank one *and* the estimate's cost is
-within 1e-6 (relative) of the SDP's dual lower bound on the optimum (`r['eta_dual']`). That bound
-is what makes the answer checkable: a certified window's estimate is provably the global optimum
-of the problem as posed. **Everything below reports certified windows only.** Where a run also had
-windows that did not certify, the count is given once and those windows are left out of every
-statistic; in the figures they appear only as grey markers or a hatched gap.
+- **An algebraic inertial factor.** Replace exponential-map operations in the preintegration formulation with the rational Cayley map, enabling a QCQP representation with auxiliary variables for coupled state and bias terms.
+- **A strengthened convex relaxation.** Add redundant algebraic constraints on the lifting variables to improve tightness of the Shor SDP relaxation. The constraints preserve feasible physical solutions while restricting the relaxed feasible set.
+- **Verification alongside estimation.** Recover a candidate state and compare its objective value with an SDP dual lower bound. Report certification separately from estimation error and heading observability.
+- **Evaluation across flight and driving sequences.** Study initialization sensitivity, relaxation tightness, bias propagation, and weakly excited motion using recorded EuRoC and UrbanNav IMU data, supplemented by a simulated quadrotor mission.
 
-| Demo | Data | Certified windows | SDP attitude error on them (median / worst) |
-|---|---|---:|---:|
-| 1. Trapped LM vs. one certified solve | EuRoC MH_04 | 1 / 1 | 0.1° |
-| 2. Whole flights | EuRoC MH_01–MH_04 | **34 / 34** | 0.59° / 4.1° |
-| 3. A safety-monitor mission | simulated quadrotor | 32 / 41 | 0.15° / 0.92° |
-| 4. Two Hong Kong drives | UrbanNav | 122 / 143 | 0.45° / 1.5° (medium), 0.79° / 6.3° (deep) |
+## Method
 
-### 1. Local solvers get trapped; the certificate does not — `demos/basins.py`
+```mermaid
+flowchart TD
+    A["IMU measurements + GNSS position/velocity fixes"] --> B["Cayley preintegration + state–bias lifting"]
+    B --> C["QCQP estimation problem"]
+    C --> D["Shor SDP + redundant constraints"]
+    D --> E["Recovered state estimate"]
+    D --> F["Dual lower bound"]
+    E --> G["Feasibility, rank and optimality-gap checks"]
+    F --> G
+    G --> H["Certified to tolerance / not certified"]
+```
 
-The figure at the top. From a random start, LM converges either to the global optimum or to a
-mirror solution about 158° away whose cost is ~7000× higher. Both are stationary points, so LM's
-own convergence test cannot tell them apart; only a lower bound on the optimal cost can, and the
-SDP's dual solution is exactly that lower bound. This window withholds attitude entirely
-(`gauge_fix=False`), and the SDP certifies with a dual gap of 6e-10.
+**Why change the preintegration factor?** The exponential map in the conventional formulation is an obstacle to an exact polynomial representation. The Cayley map is rational, allowing algebraic relations to be constructed and lifted into quadratic form. This is a reformulation of the inertial model; it is not a certificate for an unchanged exponential-map objective.
 
-| Same path, wrong drone | Basin of attraction |
+**Why add redundant constraints?** Introducing auxiliary variables makes the formulation quadratic, but dropping the rank constraint can separate those variables from the physical relationships they represent. Redundant identities restore some of this structure in the relaxation. Tightness is checked on each instance rather than assumed universally.
+
+For the lifted variable vector $x$, the QCQP and its Shor relaxation have the form
+
+$$
+\begin{aligned}
+\min_x\quad &x^\top Qx
+&\longrightarrow\quad \min_{Z\succeq0}\quad &\langle Q,Z\rangle\\
+\text{s.t.}\quad &x^\top A_i x=b_i
+&\text{s.t.}\quad &\langle A_i,Z\rangle=b_i.
+\end{aligned}
+$$
+
+The relaxation replaces $xx^\top$ by $Z$ and drops the rank-one requirement. For a feasible recovered estimate $\hat{x}$ and a valid dual bound $d$, weak duality gives
+
+$$
+d\;\leq\;f^\star_{\mathrm{QCQP}}\;\leq\;f(\hat{x}).
+$$
+
+A small gap between the endpoints bounds the estimate's suboptimality for this QCQP.
+
+### What the certificate means
+
+The demos classify a window as certified when the solution is numerically rank one and the relative candidate-to-dual gap (`eta_dual`) is at most $10^{-6}$. Feasibility and solver residuals must also be consistent with the numerical tolerances; rank alone is insufficient.
+
+- **Certification concerns the stated objective**, including its noise model, bias linearization, and priors. It does not imply agreement with ground truth.
+- **A non-certified window is inconclusive.** It is not automatically a failed estimate or proof of a local minimum.
+- **Poor observability can persist at a global optimum.** Weak heading excitation can yield inaccurate yaw even when the optimization is certified.
+- **Comparisons must use a common objective.** An exponential-map LM cost cannot be compared directly with a Cayley dual bound to certify or reject it. A baseline estimate must first be evaluated as a feasible candidate under the same QCQP and lifting constraints.
+
+## Experimental results
+
+The following results are from the extended repository demos. Paper-reproduction outputs are listed separately below.
+
+**Measurement protocol.** Recorded-data experiments use real IMU measurements and **GNSS position and velocity fixes simulated from ground truth** at each keyframe. Nominal standard deviations are 1 cm in position and 1 cm/s in velocity. The simulated degraded-GNSS interval uses 2 m and 0.5 m/s. These experiments isolate optimization and observability behavior; they are not evaluations of raw urban GNSS multipath or an actual jamming model.
+
+**Reporting protocol.** Certification counts include all windows. Attitude-error statistics below are conditional on certification; non-certified windows are excluded from those accuracy statistics and displayed as grey markers or hatched gaps in the figures.
+
+| Experiment | Certified / total windows | Attitude error on certified windows, median / worst | Main finding |
+|---|---:|---:|---|
+| Initialization sensitivity · EuRoC MH_04 | 1 / 1 | 0.1° / 0.1° | Poor attitude starts can trap local optimization |
+| Four EuRoC flights · MH_01–MH_04 | 34 / 34 | 0.59° / 4.14° | Certification across the tested flight windows |
+| Simulated quadrotor mission | 32 / 41 | 0.15° / 0.92° | Degraded GNSS can prevent certification |
+| UrbanNav · medium + deep urban | 122 / 143 | Medium: 0.45° / 1.5°; deep: 0.79° / 6.3° | Optimality and heading observability are distinct |
+
+### 1. Initialization sensitivity: similar positions, different attitudes
+
+GNSS strongly constrains position in the initialization experiment, so an incorrect orientation need not produce an obviously incorrect path. The 3D replay makes this ambiguity visible; the rotation-space animation shows the local optimizer's dependence on its starting attitude.
+
+| Trajectory and attitude replay | Attitude-initialization study |
 |---|---|
-| ![LM trapped 158° off next to the certified SDP attitude](demos/figures/drone_replay.jpg) | ![2,000 LM runs descending through the ball of attitude errors](demos/figures/basin_ball.gif) |
-| The certified window in 3D. Both estimates fly the ground-truth track, because GNSS pins position to a centimetre either way; only the attitude differs. Left: LM converged 158° off. Right: the SDP, certified, 0.1° off. | 2,000 LM runs from random attitudes, each a point in the rotation-vector ball (radius π) descending to where it converges. Blue runs reach the certified optimum; orange runs end on the mirror minimum. |
+| ![Local and certified estimates following similar position trajectories with very different attitudes](demos/figures/drone_replay.jpg) | ![Two thousand local-optimizer runs visualized in rotation-vector coordinates](demos/figures/basin_ball.gif) |
 
-### 2. Certified smoothing over whole flights — `demos/sequence_sweep.py`
+*The teaser reports 100 starts; the animation visualizes a separate 2,000-run study. Each point in the animation represents one LM run, not a robot or an SDP iteration.*
+
+### 2. Flight sequences: verification can confirm a good local solution
+
+![Certification and estimation errors over four EuRoC sequences](demos/figures/sweep.png)
+
+All 34 flight windows certify. Gravity-aligned LM agrees closely with the certified estimate on all 34, while identity-initialized LM produces large attitude discrepancies on three. This demonstrates why verification is useful even when a well-initialized local solver usually succeeds.
+
+These runs use a weak first-keyframe attitude prior and propagate the bias estimate between windows. They do not represent estimation without prior information.
+
+### 3. Degraded measurements and weak excitation reveal different limitations
+
+![Simulated mission: certified windows and intervals without a certificate](demos/figures/mission_certified.png)
+
+The simulated mission certifies 32 of 41 windows; the nine degraded-GNSS windows remain uncertified. During hover, an attitude prior can support a certified solution even when the measurements provide little heading information. The heading-excitation diagnostic distinguishes these conditions.
+
+![UrbanNav results, with non-certified windows retained as grey markers](demos/figures/urbannav_certified.png)
+
+The UrbanNav runs certify 122 of 143 windows without an attitude prior. The remaining 21 occur while the vehicle is stopped. The largest certified heading errors occur in weakly excited motion, illustrating that **solving the optimization problem globally does not remove ambiguity in the measurements**.
+
+<details>
+<summary><strong>Detailed protocols, per-sequence results, and additional visualizations</strong></summary>
+
+### Flight protocol and per-sequence breakdown — `demos/sequence_sweep.py`
 
 Back-to-back 16 s windows over four EuRoC flights, with the bias carried from window to window
 and a weak prior on the first keyframe's attitude (`gauge_fix='R_prior'`, σ = 0.05 per
@@ -73,7 +130,7 @@ as a constraint; LM gets the matching rotation prior. **Every window certifies.*
 
 ![Certificates over EuRoC MH_01–MH_04](demos/figures/sweep.png)
 
-| sequence | windows certified | attitude err. SDP (median / max) | LM, gravity-aligned start: same optimum | LM, identity start: same optimum |
+| sequence | windows certified | attitude err. SDP (median / max) | LM, gravity-aligned: attitude agreement | LM, identity: attitude agreement |
 |---|---:|---:|---:|---:|
 | MH\_01\_easy | 11 / 11 | 0.56° / 3.15° | 11 / 11 | 11 / 11 |
 | MH\_02\_easy | 9 / 9 | 0.79° / 4.14° | 9 / 9 | 8 / 9 |
@@ -83,24 +140,23 @@ as a constraint; LM gets the matching rotation prior. **Every window certifies.*
 
 - **Tight everywhere:** rank one, MOSEK status Optimal, worst dual gap 5e-7.
 - **The certificate tells you when the local solver was right.** From the standard
-  gravity-aligned start, LM finds the certified optimum on all 34 windows (to within 0.05°).
+  gravity-aligned start, LM agrees with the certified attitude on all 34 windows (to within 0.05°).
   Started from the identity attitude instead (the "LM from GNSS" initialisation of the paper's
   Fig. 1), it converges 176–177° away on 3 windows (MH_02 at 96 s, MH_04 at 48 s and 80 s). Those
-  three windows are certified, so the trapped answers are exposed immediately: their cost sits
-  above the certified lower bound.
+  three windows are certified, providing a verified reference for the Cayley problem. A formal cost-based comparison
+  requires evaluating each baseline estimate under that same objective.
 - **Optimal is not the same as accurate.** The 0.59° median (4.1° worst) attitude error is the
   error of the certified optimum itself, almost all of it heading: with GNSS and IMU only, heading
   is observed through lateral acceleration, and some windows have little.
 - **Online bias handling.** Only the first window of each flight is linearised at the dataset's
-  bias; every later one starts from the previous window's estimate. The estimate stays within
-  0.002–0.08 of the truth over every flight, with no drift.
-- An SDP solve took a median of 20 s here with four sequences sharing 12 cores (6.7 s
-  uncontended, see **Problem size**).
+  bias; every later one starts from the previous window's estimate. Bias is propagated between windows rather than repeatedly initialized from ground truth.
+- The reported median solve time is 20 s with four sequences sharing 12 cores,
+  versus 6.7 s in an uncontended run. These are configuration-dependent reference timings.
 
-### 3. A certificate as a safety monitor — `demos/sim_mission.py`
+### Simulated mission and optimality monitoring — `demos/sim_mission.py`
 
 A simulated quadrotor (`demos/sim_quad.py`, EuRoC IMU noise) flies a three-minute mission: take-off
-and hover, figure-8s, a stretch with GNSS jammed to 2 m / 0.5 m/s, a hover with slow yaw, zig-zag
+and hover, figure-8s, a stretch with GNSS noise increased to 2 m / 0.5 m/s, a hover with slow yaw, zig-zag
 dashes, and a landing. It is estimated in sliding 16 s windows every 4 s, with the same weak 2°
 attitude prior as demo 2. The SDP solves each window from scratch. LM runs the way a
 sliding-window smoother runs it, warm-started from its own previous answer, with a scripted
@@ -108,32 +164,32 @@ estimator reset from a random attitude at 44 s.
 
 ![SDP and LM attitude error on the certified windows of the mission](demos/figures/mission_certified.png)
 
-![The mission replayed through the figure-8, where a random-attitude restart is trapped and the certificate rejects it](demos/figures/mission_certified.gif)
+![The mission replayed through the figure-8, comparing a random-attitude restart with the certified Cayley reference](demos/figures/mission_certified.gif)
 
 *The figure-8 stretch, replayed at 4×. Left: the drone with truth (grey), the certified SDP
 attitude (blue) and LM (orange). Right: the mission timelines with a moving cursor. The full
 video is `demos/figures/mission.mp4`.*
 
-- **32 of the 41 windows certify**, every one outside the jammed stretch, with dual gaps of at
+- **32 of the 41 windows certify**, every one outside the degraded-GNSS stretch, with dual gaps of at
   most 4e-9. On them the SDP attitude error has a median of 0.15° and a worst case of 0.92°. The 9
-  jammed windows do not certify (2 m GNSS leaves the relaxation loose) and are left out.
-- **The warm-started smoother agrees with the certificate.** On all 32 certified windows LM's
+  degraded-GNSS windows do not certify (2 m GNSS leaves the relaxation loose) and are left out.
+- **The warm-started smoother agrees closely with the certified estimate.** On all 32 certified windows LM's
   sliding-window estimate is within 0.03° of the certified optimum, including after the reset.
-- **Trapped restarts are caught.** Restarting LM from a random attitude on a certified window ends
+- **Random restarts expose additional local-solver failures.** Restarting LM from a random attitude on a certified window ends
   in a mirror minimum 8% of the time averaged over these windows (45% on the worst three). The
   fixed draw used in the figure is trapped on three windows (t = 20, 28 and 52 s), 158–161° off.
-  All three are certified windows, so each trapped answer is rejected the moment it is compared
-  against the certified bound.
+  All three have a certified Cayley reference. Certifying or rejecting the LM candidates
+  themselves requires feasibility and cost evaluation under the same Cayley QCQP.
 - **Hover certifies, and the monitor still says why.** Take-off and the landing hover have no
   horizontal acceleration, so the data say nothing about heading. With the attitude prior these
   six windows certify within 0.5°, and the heading-excitation flag (`r['wahba_sv']`, log₁₀ σ₂/σ₁
   below −4) marks them as windows whose yaw rests on the prior rather than on the measurements.
 
-### 4. Two Hong Kong drives — `demos/urbannav_map.py`
+### UrbanNav driving protocol — `demos/urbannav_map.py`
 
 UrbanNav medium-urban (Tsim Sha Tsui) and deep-urban (Whampoa): a car with a consumer IMU, 39
 minutes in 143 back-to-back 16 s windows. GNSS is simulated from ground truth as above, and here
-the estimator gets **no attitude information at all** (`gauge_fix=False`).
+the estimator uses **no attitude prior** (`gauge_fix=False`).
 
 ![Certified windows along the two UrbanNav drives, coloured by heading error](demos/figures/urbannav_certified.png)
 
@@ -145,9 +201,84 @@ the estimator gets **no attitude information at all** (`gauge_fix=False`).
   are the ones the heading-excitation flag marks as weakly observable (dotted in the figure).
   Every other certified window is within 2.8°.
 - **LM agrees on every certified window.** From both the gravity-aligned and the identity start,
-  LM reaches the certified optimal cost on all 122.
+  the supplied experiments report agreement with the certified solution on all 122.
+  Cross-formulation cost agreement should not be interpreted as a certificate for the exponential-map objective.
 
-### Reproducing the demos
+
+</details>
+
+## Scope and current limitations
+
+- **Windowed reference implementation.** The demos solve 16 s windows with MOSEK. The reported timings do not establish a real-time navigation backend.
+- **Initialization and prior information are different.** The SDP does not require a user-supplied trajectory starting point, but the problem still uses measurements, bias linearization points, and any configured priors. The flight sweep starts its first window from the dataset bias and propagates subsequent bias estimates.
+- **Tightness depends on the instance.** Degraded GNSS and stationary driving intervals include non-certified windows. The method does not guarantee a rank-one relaxation for arbitrary noise or motion.
+- **The guarantee is model-specific.** Certification applies to the implemented Cayley formulation and its weighting assumptions. Weak observability, model mismatch, or inaccurate measurements can still produce an inaccurate certified estimate.
+
+## Quick start
+
+### Install the environment
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+The supplied implementation reports testing with Python 3.13 / NumPy 2.5 / GTSAM 4.3.0 and with the original Python 3.9 / NumPy 1.23 / GTSAM 4.2 environment, using MOSEK 11.2. Follow `requirements.txt` for compatible versions. GTSAM 4.2.x wheels are reported to crash with NumPy 2 when setting the gyroscope covariance; a real-data SDP run alone may not expose this mismatch.
+
+**Running SDP solves requires a MOSEK license.** [Academic licenses](https://www.mosek.com/license/request/) are available; place the license at `~/mosek/mosek.lic`. Plotting the supplied results does not require solving a new SDP or downloading datasets.
+
+### Inspect a result without rerunning optimization
+
+```bash
+cp results/ablation_svr.json .
+python ablation_figs.py
+```
+
+This regenerates `ablation.png` from the supplied paper results. It is the shortest route to inspecting the redundant-constraint ablation. Demo plotting and rendering scripts similarly use the JSON in `demos/out/`.
+
+### Solve a single window
+
+After configuring the EuRoC paths below:
+
+```python
+import numpy as np
+import sdp_preintegration_cayley as C
+import datasets
+
+r = C.run_euroc(
+    datasets.euroc(), T=16.0, kf_interval=1.0, t_start=6.0,
+    weight_mode='dataset_cov', iso_reduce='mean',
+    prior_sigmas=(1e-2, 1e-2, 1e-3, 1e-3), gauge_fix='R',
+    add_redundant=True, kf_per_bias=8, accept_any=True,
+)
+print('Numerical rank:', r['rank'])
+print('Reported relaxation gap:', r['eta'])
+print('Relative candidate-to-dual gap:', r['eta_dual'])
+print('Mean reported rotation error:', np.mean(r['rot_err']))
+# Inspect rank, dual gap, feasibility, and solver residuals together.
+# Rank one alone is not a numerical optimality certificate.
+```
+
+This example uses `gauge_fix='R'`; it is not the no-attitude-information configuration. Use `gauge_fix=False` to withhold attitude information. Add `gnss_seed=0` to perturb ground-truth position and velocity with the configured noise rather than using unperturbed ground truth. `run_synthetic` and `run_urbannav` expose the corresponding entry points.
+
+## Datasets
+
+EuRoC and UrbanNav are not included. Configure paths after downloading:
+
+```bash
+export EUROC_MH01=/path/to/MH_01_easy/mav0
+export EUROC_ROOT=/path/to/euroc
+export URBANNAV_ROOT=/path/to/urbannav
+```
+
+- **[EuRoC Machine Hall](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets):** the supplied experiments use 200 Hz IMU and ground truth. The paper uses MH_01; the flight demos use MH_01–MH_04. Each sequence needs `imu0/` and `state_groundtruth_estimate0/` beneath `mav0/`.
+- **[UrbanNav](https://github.com/IPNL-POLYU/UrbanNavDataset):** medium-urban and deep-urban sequences, with IMU resampled to approximately 400 Hz. See `urbannav_data.py` for the empirically established frame conventions; check them when adapting the loader to other sequences.
+- **Synthetic mission:** `demos/sim_quad.py` writes EuRoC-format data to `data/sim/quad_mission/mav0`, allowing the existing real-data entry points and baseline to process it.
+
+`datasets.py` resolves dataset paths and reports missing inputs. Synthetic experiments require no external dataset.
+
+## Reproducing the demos
 
 ```bash
 python demos/basins.py && python demos/plot_basins.py            # demo 1 (top figure)
@@ -169,46 +300,6 @@ can hold: `uv venv .venv-web && uv pip install -p .venv-web viser==0.2.23 trimes
 and the LM baseline run on it unchanged. Interactive versions of the 3D scenes and the UrbanNav
 map are on the [project page](https://ur10.github.io/projects/certifiable-imu/).
 
----
-
-## Requirements
-
-```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-```
-
-Tested with Python 3.13 / NumPy 2.5 / gtsam 4.3.0, and with the paper's original Python 3.9 /
-NumPy 1.23 / gtsam 4.2 (MOSEK 11.2 in both). **gtsam must match NumPy's major version**: the gtsam
-4.2.x wheels segfault under NumPy 2 in `PreintegrationParams.setGyroscopeCovariance`, which every
-synthetic run and the GTSAM baseline call (the real-data SDP runs don't, so a mismatched env looks
-fine until then). See `requirements.txt`.
-
-**MOSEK needs a licence.** It is the solver behind every result here. Academic licences are free
-(<https://www.mosek.com/license/request/>); place the licence file at `~/mosek/mosek.lic`. Nothing
-in this repository will run without it.
-
-## Datasets
-
-EuRoC and UrbanNav are not vendored. Download them and point environment variables at your
-copies:
-
-```bash
-export EUROC_MH01=/path/to/MH_01_easy/mav0      # the directory containing imu0/ and state_groundtruth_estimate0/
-export EUROC_ROOT=/path/to/euroc                # for demos/: holds MH_01_easy/mav0, MH_02_easy/mav0, ...
-export URBANNAV_ROOT=/path/to/urbannav
-```
-
-- **EuRoC Machine Hall** — <https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets>
-  (IMU at 200 Hz, ground truth at 200 Hz). The paper uses MH_01; the demos use MH_01–MH_04 and
-  need only `imu0/` and `state_groundtruth_estimate0/` from each.
-- **UrbanNav**, medium-urban and deep-urban — <https://github.com/IPNL-POLYU/UrbanNavDataset>
-  (IMU resampled to ~400 Hz; see `urbannav_data.py` for the frame conventions, which were
-  established empirically rather than from the dataset documentation)
-
-Paths resolve through `datasets.py`, which fails with an actionable message rather than a stack
-trace if a dataset is missing. The synthetic experiments need no dataset.
-
----
 
 ## Reproducing the paper
 
@@ -231,35 +322,21 @@ of outputs ship with the repository:
 | `runs/free_gauge_cw/` | Fig. 1 and Fig. 3 re-run in the paper's free gauge with the current solver |
 | `runs/centre_whiten/` | every paper script re-run with the current defaults (`gauge_fix='R'`) |
 
-See **Changes since the paper** for why the latter two differ from the first.
+**Compare like-for-like configurations.** The directories differ in solver version and attitude/gauge settings; a rerun with a fixed rotation is not the same estimation problem as a free-attitude run. Preserve those settings when comparing costs, tightness, or figures.
 
-### Start here if you have no datasets or no patience
+## Code guide
 
-```bash
-cp results/ablation_svr.json . && python3 ablation_figs.py
-```
-
-This redraws Fig. 3 from the shipped data in a few seconds, and is the quickest check that the
-environment is set up. The regenerated `ablation.png` is byte-identical to the figure in the
-paper.
-
-### A single window, end to end
-
-```python
-import numpy as np, sdp_preintegration_cayley as C, datasets
-r = C.run_euroc(datasets.euroc(), T=16.0, kf_interval=1.0, t_start=6.0,
-                weight_mode='dataset_cov', iso_reduce='mean',
-                prior_sigmas=(1e-2, 1e-2, 1e-3, 1e-3), gauge_fix='R',
-                add_redundant=True, kf_per_bias=8, accept_any=True)
-print(r['rank'], r['eta'], r['eta_dual'], np.mean(r['rot_err']))   # rank 1 => certified
-```
-
-Those keyword arguments are the paper's nominal configuration. `run_synthetic` and
-`run_urbannav` take the same ones. Add `gnss_seed=0` to corrupt the GNSS fixes with noise of the
-stated sigmas instead of using ground truth, and `gauge_fix=False` to withhold all attitude
-information, as the demos do.
-
-
+| Entry point | Purpose |
+|---|---|
+| `sdp_preintegration_cayley.py` | Cayley SDP solver and synthetic / real-data entry points |
+| `datasets.py` | Dataset path resolution |
+| `urbannav_data.py` | UrbanNav loading and coordinate conventions |
+| `cayley_ablation_plots.py`, `ablation_figs.py` | Redundant-constraint ablations and figures |
+| `cayley_uniform_experiments.py` | Paper benchmark runs |
+| `compare_gtsam_cayley.py` | Comparison with standard preintegration |
+| `demos/` | Initialization, flight, simulated-mission, and driving studies |
+| `demos/out/` | Saved demo results for plotting and rendering |
+| `demos/figures/` | README figures, animations, and mission video |
 
 ## Citation
 
