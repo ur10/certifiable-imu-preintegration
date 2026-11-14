@@ -8,7 +8,7 @@
 **Utkarsh Rai · Zhexin Xu · Bang-Shien Chen · David Rosen**  
 Robust Autonomy Lab · Institute for Experiential Robotics · Northeastern University
 
-[**Paper**](https://arxiv.org/abs/2609.38048) · [**Project & interactive demos**](https://ur10.github.io/projects/certifiable-imu/) · [**Method**](#method) · [**Results**](#experimental-results) · [**Quick start**](#quick-start) · [**Reproduce the paper**](#reproducing-the-paper)
+[**Paper**](https://arxiv.org/abs/2609.38048) · [**Interactive demos**](#interactive-demos) · [**Method**](#method) · [**Results**](#experimental-results) · [**Quick start**](#quick-start) · [**Reproduce the paper**](#reproducing-the-paper)
 
 ## Can we verify an inertial navigation estimate?
 
@@ -158,7 +158,7 @@ as a constraint; LM gets the matching rotation prior. **Every window certifies.*
 A simulated quadrotor (`demos/sim_quad.py`, EuRoC IMU noise) flies a three-minute mission: take-off
 and hover, figure-8s, a stretch with GNSS noise increased to 2 m / 0.5 m/s, a hover with slow yaw, zig-zag
 dashes, and a landing. It is estimated in sliding 16 s windows every 4 s, with the same weak 2°
-attitude prior as demo 2. The SDP solves each window from scratch. LM runs the way a
+attitude prior as the flight sweep. The SDP solves each window from scratch. LM runs the way a
 sliding-window smoother runs it, warm-started from its own previous answer, with a scripted
 estimator reset from a random attitude at 44 s.
 
@@ -206,6 +206,28 @@ the estimator uses **no attitude prior** (`gauge_fix=False`).
 
 
 </details>
+
+## Interactive demos
+
+Everything below runs from files in this repository; nothing is hosted elsewhere.
+
+| Demo | Open it | What you see |
+|---|---|---|
+| **Two Hong Kong drives on a map** | [Medium urban, Tsim Sha Tsui](demos/figures/urbannav_medium.geojson) · [Deep urban, Whampoa](demos/figures/urbannav_deep.geojson) | GitHub renders these GeoJSON files as zoomable street maps. Each certified 16 s window is a segment coloured by heading error (light blue 0°, dark blue ≥ 2°); thin translucent segments are weakly observable heading; grey markers are the car at a stop (not certified). Click any feature for its certificate, dual gap, excitation and errors. |
+| **The full mission video** | [`demos/figures/mission.mp4`](demos/figures/mission.mp4) (1.5 MB) | The whole three-minute simulated mission replayed at 4×, with the certificate, heading-excitation flag, restart risk and both estimators' attitude error on moving timelines. The GIF in the detailed results is its figure-8 stretch. |
+| **Same path, wrong drone** (3D) | run locally, below | The certified MH_04 window in 3D: LM's trapped attitude (158° off) next to the certified SDP attitude (0.1° off), both flying the ground-truth track. Orbit, zoom and scrub the 16 s timeline. |
+| **Basin of attraction** (3D) | run locally, below | 2,000 LM runs from random attitudes, each a point in the rotation-vector ball, descending to where it converges: blue to the certified optimum, orange to the mirror minimum. |
+
+The two 3D scenes are [Viser](https://viser.studio) recordings played in Viser's web viewer. They
+need neither MOSEK nor the datasets:
+
+```bash
+uv venv .venv-web && uv pip install -p .venv-web viser==0.2.23 trimesh
+.venv-web/bin/python demos/web/serve_replays.py      # prints one localhost link per scene
+```
+
+The script builds both recordings from `demos/out/` on first use, serves them at
+`http://localhost:8000`, and prints the two links to open.
 
 ## Scope and current limitations
 
@@ -281,14 +303,15 @@ export URBANNAV_ROOT=/path/to/urbannav
 ## Reproducing the demos
 
 ```bash
-python demos/basins.py && python demos/plot_basins.py            # demo 1 (top figure)
+python demos/basins.py && python demos/plot_basins.py            # initialization sensitivity (top figure)
 for s in MH_01_easy MH_02_easy MH_03_medium MH_04_difficult; do
-  python demos/sequence_sweep.py --seq $s &                      # demo 2
+  python demos/sequence_sweep.py --seq $s &                      # flight sequences
 done; wait; python demos/plot_sweep.py
-python demos/sim_quad.py && python demos/sim_mission.py          # demo 3, ~25 min
+python demos/sim_quad.py && python demos/sim_mission.py          # simulated mission, ~25 min
 python demos/render_mission.py                                   #   -> demos/figures/mission.mp4
-python demos/urbannav_map.py --workers 5                         # demo 4, ~40 min
-python demos/plot_certified.py                                   # demos 3 and 4 figures
+python demos/urbannav_map.py --workers 5                         # UrbanNav drives, ~40 min
+python demos/plot_certified.py                                   # mission and UrbanNav figures
+python demos/web/make_geojson.py                                 # UrbanNav GeoJSON maps
 ```
 
 The JSON behind every figure is in `demos/out/`, so the `plot_*.py` scripts and
@@ -297,8 +320,8 @@ from Viser recordings (`demos/basin_ball.py` → `demos/web/make_replay.py`, `ma
 `render_ball_clip.py`); those need `viser==0.2.23` and `trimesh`, which a separate small venv
 can hold: `uv venv .venv-web && uv pip install -p .venv-web viser==0.2.23 trimesh`.
 `sim_quad.py` writes its mission in EuRoC format (`data/sim/quad_mission/mav0`), so `run_euroc`
-and the LM baseline run on it unchanged. Interactive versions of the 3D scenes and the UrbanNav
-map are on the [project page](https://ur10.github.io/projects/certifiable-imu/).
+and the LM baseline run on it unchanged. To explore the 3D scenes and the UrbanNav map
+interactively, see [Interactive demos](#interactive-demos).
 
 
 ## Reproducing the paper
@@ -336,7 +359,8 @@ of outputs ship with the repository:
 | `compare_gtsam_cayley.py` | Comparison with standard preintegration |
 | `demos/` | Initialization, flight, simulated-mission, and driving studies |
 | `demos/out/` | Saved demo results for plotting and rendering |
-| `demos/figures/` | README figures, animations, and mission video |
+| `demos/figures/` | README figures, animations, mission video, and UrbanNav GeoJSON maps |
+| `demos/web/` | Viser 3D recordings, the local replay server, and the GeoJSON export |
 
 ## Citation
 
