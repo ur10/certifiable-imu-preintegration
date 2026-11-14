@@ -30,59 +30,144 @@ good ones. The Cayley SDP is solved once, without an initial guess, and certifie
 
 ---
 
-## Demos on EuRoC
+## Demos: the certified windows
 
-Both demos pose the problem a GNSS–IMU system actually faces: GNSS velocity and position fixes on
-every keyframe (simulated as ground truth plus 1 cm/s and 1 cm noise), raw IMU, and **no attitude
-information at all**, neither as an anchor nor as an initial guess (`gauge_fix=False`). Both
-estimators see the identical measurements. A window counts as certified when the SDP solution has
-rank one *and* the estimate's cost is within 1e-6 (relative) of the SDP's dual lower bound on the
-optimum, `r['eta_dual']`.
+Every demo poses the problem a GNSS–IMU system actually faces: GNSS velocity and position fixes
+on every keyframe (simulated from ground truth with 1 cm/s and 1 cm of noise, or 2 m and
+0.5 m/s while jammed) and raw IMU, with **no initial guess**. Levenberg–Marquardt on the standard exp-map
+factor graph (GTSAM) sees the identical measurements.
+
+A window counts as **certified** when the SDP solution has rank one *and* the estimate's cost is
+within 1e-6 (relative) of the SDP's dual lower bound on the optimum (`r['eta_dual']`). That bound
+is what makes the answer checkable: a certified window's estimate is provably the global optimum
+of the problem as posed. **Everything below reports certified windows only.** Where a run also had
+windows that did not certify, the count is given once and those windows are left out of every
+statistic; in the figures they appear only as grey markers or a hatched gap.
+
+| Demo | Data | Certified windows | SDP attitude error on them (median / worst) |
+|---|---|---:|---:|
+| 1. Trapped LM vs. one certified solve | EuRoC MH_04 | 1 / 1 | 0.1° |
+| 2. Whole flights | EuRoC MH_01–MH_04 | **34 / 34** | 0.59° / 4.1° |
+| 3. A safety-monitor mission | simulated quadrotor | 32 / 41 | 0.15° / 0.92° |
+| 4. Two Hong Kong drives | UrbanNav | 122 / 143 | 0.45° / 1.5° (medium), 0.79° / 6.3° (deep) |
 
 ### 1. Local solvers get trapped; the certificate does not — `demos/basins.py`
 
-The figure above. From a random start, LM converges either to the global optimum or to a mirror
-solution about 158° away whose cost is ~7000× higher. Both are stationary points, so LM's own
-convergence test cannot tell them apart; only a lower bound on the optimal cost can, and the
-SDP's dual solution is exactly that lower bound.
+The figure at the top. From a random start, LM converges either to the global optimum or to a
+mirror solution about 158° away whose cost is ~7000× higher. Both are stationary points, so LM's
+own convergence test cannot tell them apart; only a lower bound on the optimal cost can, and the
+SDP's dual solution is exactly that lower bound. This window withholds attitude entirely
+(`gauge_fix=False`), and the SDP certifies with a dual gap of 6e-10.
+
+| Same path, wrong drone | Basin of attraction |
+|---|---|
+| ![LM trapped 158° off next to the certified SDP attitude](demos/figures/drone_replay.jpg) | ![2,000 LM runs descending through the ball of attitude errors](demos/figures/basin_ball.gif) |
+| The certified window in 3D. Both estimates fly the ground-truth track, because GNSS pins position to a centimetre either way; only the attitude differs. Left: LM converged 158° off. Right: the SDP, certified, 0.1° off. | 2,000 LM runs from random attitudes, each a point in the rotation-vector ball (radius π) descending to where it converges. Blue runs reach the certified optimum; orange runs end on the mirror minimum. |
 
 ### 2. Certified smoothing over whole flights — `demos/sequence_sweep.py`
 
+Back-to-back 16 s windows over four EuRoC flights, with the bias carried from window to window
+and a weak prior on the first keyframe's attitude (`gauge_fix='R_prior'`, σ = 0.05 per
+rotation-matrix entry, about 2°). The prior enters the cost as a penalty ‖R₀ − R̄₀‖²_F / σ², not
+as a constraint; LM gets the matching rotation prior. **Every window certifies.**
+
 ![Certificates over EuRoC MH_01–MH_04](demos/figures/sweep.png)
 
-| sequence | windows | certified | attitude err. SDP (median / max) | LM, gravity-aligned start: same optimum | LM, identity start: same optimum |
-|---|---:|---:|---:|---:|---:|
-| MH\_01\_easy | 11 | 10 | 0.57° / 3.65° | 11 / 11 | 11 / 11 |
-| MH\_02\_easy | 9 | 9 | 0.82° / 5.24° | 9 / 9 | 8 / 9 |
-| MH\_03\_medium | 8 | 7 | 1.06° / 2.91° | 8 / 8 | 8 / 8 |
-| MH\_04\_difficult | 6 | 6 | 0.53° / 1.52° | 6 / 6 | 4 / 6 |
-| **all** | 34 | 32 | 0.71° / 5.24° | 34 / 34 | 31 / 34 |
+| sequence | windows certified | attitude err. SDP (median / max) | LM, gravity-aligned start: same optimum | LM, identity start: same optimum |
+|---|---:|---:|---:|---:|
+| MH\_01\_easy | 11 / 11 | 0.56° / 3.15° | 11 / 11 | 11 / 11 |
+| MH\_02\_easy | 9 / 9 | 0.79° / 4.14° | 9 / 9 | 8 / 9 |
+| MH\_03\_medium | 8 / 8 | 0.67° / 1.88° | 8 / 8 | 8 / 8 |
+| MH\_04\_difficult | 6 / 6 | 0.52° / 1.51° | 6 / 6 | 4 / 6 |
+| **all** | **34 / 34** | 0.59° / 4.14° | 34 / 34 | 31 / 34 |
 
-- **32 of 34 windows certify.** The two that do not are MH_03 at take-off (rank 3; the window
-  with the least lateral motion of all 34) and MH_01 at 64 s (rank one, but MOSEK stopped with
-  status Unknown at a dual gap of 1e-5).
-- **The local solver is usually right, and the SDP says when.** From the standard
-  gravity-aligned start, LM finds the same optimum on all 34 windows. Started from the identity
-  attitude instead (the "LM from GNSS" initialisation of the paper's Fig. 1), it converges 176–177°
-  away on 3 windows (MH_02 at 96 s, MH_04 at 48 s and 80 s), all three of which the SDP certified.
-  Where LM succeeds the two estimates agree to within 0.07°; what the SDP adds is the proof.
-- **Optimal is not the same as accurate.** The remaining 0.7° median (5.2° worst) attitude error
-  is the error of the certified optimum itself, ~97% of it heading: with GNSS and IMU only,
-  heading is observed through lateral acceleration, and some windows have little.
+- **Tight everywhere:** rank one, MOSEK status Optimal, worst dual gap 5e-7.
+- **The certificate tells you when the local solver was right.** From the standard
+  gravity-aligned start, LM finds the certified optimum on all 34 windows (to within 0.05°).
+  Started from the identity attitude instead (the "LM from GNSS" initialisation of the paper's
+  Fig. 1), it converges 176–177° away on 3 windows (MH_02 at 96 s, MH_04 at 48 s and 80 s). Those
+  three windows are certified, so the trapped answers are exposed immediately: their cost sits
+  above the certified lower bound.
+- **Optimal is not the same as accurate.** The 0.59° median (4.1° worst) attitude error is the
+  error of the certified optimum itself, almost all of it heading: with GNSS and IMU only, heading
+  is observed through lateral acceleration, and some windows have little.
 - **Online bias handling.** Only the first window of each flight is linearised at the dataset's
   bias; every later one starts from the previous window's estimate. The estimate stays within
-  0.02–0.07 of the truth over every flight, with no drift.
-- An SDP solve took a median of 47 s here with four sequences sharing 12 cores (6.7 s
+  0.002–0.08 of the truth over every flight, with no drift.
+- An SDP solve took a median of 20 s here with four sequences sharing 12 cores (6.7 s
   uncontended, see **Problem size**).
 
+### 3. A certificate as a safety monitor — `demos/sim_mission.py`
+
+A simulated quadrotor (`demos/sim_quad.py`, EuRoC IMU noise) flies a three-minute mission: take-off
+and hover, figure-8s, a stretch with GNSS jammed to 2 m / 0.5 m/s, a hover with slow yaw, zig-zag
+dashes, and a landing. It is estimated in sliding 16 s windows every 4 s, with the same weak 2°
+attitude prior as demo 2. The SDP solves each window from scratch. LM runs the way a
+sliding-window smoother runs it, warm-started from its own previous answer, with a scripted
+estimator reset from a random attitude at 44 s.
+
+![SDP and LM attitude error on the certified windows of the mission](demos/figures/mission_certified.png)
+
+![The mission replayed through the figure-8, where a random-attitude restart is trapped and the certificate rejects it](demos/figures/mission_certified.gif)
+
+*The figure-8 stretch, replayed at 4×. Left: the drone with truth (grey), the certified SDP
+attitude (blue) and LM (orange). Right: the mission timelines with a moving cursor. The full
+video is `demos/figures/mission.mp4`.*
+
+- **32 of the 41 windows certify**, every one outside the jammed stretch, with dual gaps of at
+  most 4e-9. On them the SDP attitude error has a median of 0.15° and a worst case of 0.92°. The 9
+  jammed windows do not certify (2 m GNSS leaves the relaxation loose) and are left out.
+- **The warm-started smoother agrees with the certificate.** On all 32 certified windows LM's
+  sliding-window estimate is within 0.03° of the certified optimum, including after the reset.
+- **Trapped restarts are caught.** Restarting LM from a random attitude on a certified window ends
+  in a mirror minimum 8% of the time averaged over these windows (45% on the worst three). The
+  fixed draw used in the figure is trapped on three windows (t = 20, 28 and 52 s), 158–161° off.
+  All three are certified windows, so each trapped answer is rejected the moment it is compared
+  against the certified bound.
+- **Hover certifies, and the monitor still says why.** Take-off and the landing hover have no
+  horizontal acceleration, so the data say nothing about heading. With the attitude prior these
+  six windows certify within 0.5°, and the heading-excitation flag (`r['wahba_sv']`, log₁₀ σ₂/σ₁
+  below −4) marks them as windows whose yaw rests on the prior rather than on the measurements.
+
+### 4. Two Hong Kong drives — `demos/urbannav_map.py`
+
+UrbanNav medium-urban (Tsim Sha Tsui) and deep-urban (Whampoa): a car with a consumer IMU, 39
+minutes in 143 back-to-back 16 s windows. GNSS is simulated from ground truth as above, and here
+the estimator gets **no attitude information at all** (`gauge_fix=False`).
+
+![Certified windows along the two UrbanNav drives, coloured by heading error](demos/figures/urbannav_certified.png)
+
+- **122 of 143 windows certify**, with dual gaps of at most 4e-7. The 21 that do not are all the car at a stop (mean speed
+  0 m/s), drawn as grey dots and left out.
+- **Accuracy of the certified optimum:** attitude error median 0.45° (worst 1.5°) in medium-urban
+  and 0.79° (worst 6.3°) in deep-urban.
+- **The flag explains the outliers.** The three worst certified windows in deep-urban (3.5–6.3°)
+  are the ones the heading-excitation flag marks as weakly observable (dotted in the figure).
+  Every other certified window is within 2.8°.
+- **LM agrees on every certified window.** From both the gravity-aligned and the identity start,
+  LM reaches the certified optimal cost on all 122.
+
+### Reproducing the demos
+
 ```bash
+python demos/basins.py && python demos/plot_basins.py            # demo 1 (top figure)
 for s in MH_01_easy MH_02_easy MH_03_medium MH_04_difficult; do
-  python demos/sequence_sweep.py --seq $s &      # 5-15 min per sequence; run in parallel
-done; wait
-python demos/plot_sweep.py
+  python demos/sequence_sweep.py --seq $s &                      # demo 2
+done; wait; python demos/plot_sweep.py
+python demos/sim_quad.py && python demos/sim_mission.py          # demo 3, ~25 min
+python demos/render_mission.py                                   #   -> demos/figures/mission.mp4
+python demos/urbannav_map.py --workers 5                         # demo 4, ~40 min
+python demos/plot_certified.py                                   # demos 3 and 4 figures
 ```
 
-The JSON behind both figures is in `demos/out/`, so `plot_*.py` runs without the datasets.
+The JSON behind every figure is in `demos/out/`, so the `plot_*.py` scripts and
+`render_mission.py` run without the datasets or MOSEK. The 3D still and the basin animation come
+from Viser recordings (`demos/basin_ball.py` → `demos/web/make_replay.py`, `make_ball.py`,
+`render_ball_clip.py`); those need `viser==0.2.23` and `trimesh`, which a separate small venv
+can hold: `uv venv .venv-web && uv pip install -p .venv-web viser==0.2.23 trimesh`.
+`sim_quad.py` writes its mission in EuRoC format (`data/sim/quad_mission/mav0`), so `run_euroc`
+and the LM baseline run on it unchanged. Interactive versions of the 3D scenes and the UrbanNav
+map are on the [project page](https://ur10.github.io/projects/certifiable-imu/).
 
 ---
 
@@ -197,7 +282,7 @@ Experiments:
 | `traj_178.py` / `teaser_3dinset.py` | `traj_teaser.json` → Fig. 1 |
 | `cayley_progressive_tightening.py` | `progressive_tightening.json` — rank collapse as constraint families are added. Supplementary; needs no dataset. |
 | `cayley_dual_certificate.py` | Explicit dual certificate, retaining the constraint multipliers |
-| `demos/` | The two EuRoC demos above |
+| `demos/` | The four demos above, and `plot_certified.py` for the certified-window figures |
 | `experiments/` | A/B studies behind the solver changes since the paper: conditioning, objective scaling, covariance isotropisation |
 
 ### Problem size
@@ -252,10 +337,16 @@ lifting variables are the majority of the cone: 384 of 652 at 17 keyframes.
 
 - **A certificate is not a guarantee of accuracy.** It certifies global optimality of the problem
   as posed. When a window barely accelerates sideways, heading is weakly observable and the
-  optimum itself can sit degrees from the truth (demo 2, right panel); on stationary UrbanNav
-  windows (medium@40 s, deep@90 s) the free gauge certifies at rank one with 72–82° of pure
-  heading error. `r['wahba_sv']` exposes the excitation, and a window whose second singular value
-  is tiny relative to the first should not be trusted for heading, certified or not.
+  optimum itself can sit degrees from the truth. With the paper's legacy solver, stationary
+  UrbanNav windows (medium@40 s, deep@90 s) certified at rank one with 72–82° of pure heading
+  error. With the current solver, stopped windows mostly fail to certify: in the UrbanNav map
+  demo, all 21 uncertified windows of 143 are the car at a stop. They can still certify, though:
+  in the simulated mission run without an attitude prior (`sim_mission.py --r0-sigma 0`, saved as
+  `demos/out/sim_mission_free.json`), one hovering landing window certifies with 167° of heading
+  error. With the default weak 2° prior every hover window certifies within 0.5°, and the
+  excitation flag still reports that the yaw is resting on the prior.
+  `r['wahba_sv']` exposes the excitation. Do not trust heading from a window whose second singular
+  value is tiny relative to the first (log₁₀ σ₂/σ₁ below about −4), certified or not.
 - **The bias prior must be informative.** Tightness relies on the bias being pinned near its
   linearisation point, as it is by the paper's random-walk prior (σ_bg ≈ 8e-5 rad/s, σ_ba ≈ 1e-2
   m/s² over 16 s). With a broad prior (0.05 rad/s, 0.3 m/s²) the relaxation is not tight (rank
@@ -267,6 +358,12 @@ lifting variables are the majority of the cone: 384 of 652 at 17 keyframes.
   (4/4 windows certified at rank one) is unaffected.
 - **Observability.** One Table II window in 36 fails to certify; it is near-stationary, where the
   accelerometer bias and the specific force are not separately observable.
+- **Starting at rest needs an attitude prior.** With GNSS and IMU alone, a window with no
+  horizontal acceleration has no defined heading, and in the free gauge the relaxation is not tight
+  (EuRoC MH_03 at take-off: rank 3). A weak prior on R₀ (`gauge_fix='R_prior'`) restores it:
+  `R0_prior_sigma=0.05` (~2°) certifies all 34 sweep windows, while 0.1 (~4°) misses at take-off
+  (dual gap 1.1e-6). The demos centre this prior on ground truth; a deployed system would take it
+  from a magnetometer or the previous window.
 - **Rank alone over-reports certification.** A few loose relaxations in the Fig. 3 ablation
   (stages 0–2) report log SVR > 6 while η is 0.04–0.13, and some MOSEK statuses there are
   Unknown/Undefined. The demos therefore require a dual gap ≤ 1e-6 as well as rank one.

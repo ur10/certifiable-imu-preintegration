@@ -6,6 +6,8 @@ Every demo poses the same problem to both estimators:
     N(0, 1 cm/s) and N(0, 1 cm) noise (`simulate_gnss`), with the SAME draws handed to both;
   * the free gauge: neither estimator is told the attitude of any keyframe. Roll and pitch are
     observable through gravity, heading only through horizontal acceleration;
+    (sequence_sweep.py is the exception: it adds a weak ~2 deg prior on the first attitude,
+    gauge_fix='R_prior', which a window starting at rest needs to certify);
   * the paper's nominal weights (`dataset_cov`, per-edge propagated covariance) and two bias
     blocks per 16 s window.
 
@@ -41,16 +43,28 @@ def certified(r):
     is the certificate itself. Rank alone is not enough: a loose relaxation can still report one
     dominant eigenvalue. The primal `eta` (against the interior point's own objective) is
     recorded too, but it overstates the gap when that iterate is slightly infeasible.
+
+    A gap below -ETA_TOL means the "lower bound" sits above the estimate's cost: the dual is
+    inaccurate, so it certifies nothing. Hence |eta_dual|.
     """
     ed = r.get('eta_dual')
-    return r.get('rank') == 1 and ed is not None and ed <= ETA_TOL
+    return r.get('rank') == 1 and ed is not None and abs(ed) <= ETA_TOL
 
 
-def solve_window(seq, t_start, gnss_seed, bias_init='gt', prior_sigmas=PRIOR_SIGMAS):
-    """One SDP solve plus the matched window for the LM baseline."""
+def solve_window(seq, t_start, gnss_seed, bias_init='gt', prior_sigmas=PRIOR_SIGMAS, gauge_fix=False,
+                 R0_prior_sigma=None):
+    """One SDP solve plus the matched window for the LM baseline.
+
+    gauge_fix=False (the demos' default) tells neither estimator any attitude. 'R' hard-anchors
+    R_0 at its ground-truth value, the solver's default and the setting under which every EuRoC
+    window certifies; pair it with run_lm(..., anchor_R0=R_true[0]) so LM is told the same.
+    'R_prior' (with R0_prior_sigma, per matrix entry) is the soft version: a penalty
+    ||R_0 - R_true_0||_F^2 / sigma^2 in the cost instead of an equality. Its LM counterpart is
+    anchor_R0 with anchor_sigma = sigma / sqrt(2) rad (||R - Rbar||_F^2 ~ 2 theta^2).
+    """
     base = datasets.euroc_sequence(seq)
     r = C.run_euroc(base, T=T, kf_interval=KFI, t_start=t_start, weight_mode='dataset_cov',
-                    iso_reduce='mean', prior_sigmas=prior_sigmas, gauge_fix=False,
+                    iso_reduce='mean', prior_sigmas=prior_sigmas, gauge_fix=gauge_fix, R0_prior_sigma=R0_prior_sigma,
                     add_redundant=True, kf_per_bias=KFPB, accept_any=True,
                     gnss_seed=gnss_seed, bias_init=bias_init,
                     gyro_nd=X.ND_G, accel_nd=X.ND_A, gyro_rw=X.GYRO_RW, accel_rw=X.ACCEL_RW)
@@ -61,10 +75,34 @@ def solve_window(seq, t_start, gnss_seed, bias_init='gt', prior_sigmas=PRIOR_SIG
     return r, W
 
 
-def run_lm(W, R_true, init, seed=0, prior_sigmas=PRIOR_SIGMAS):
+def run_lm(W, R_true, init, seed=0, prior_sigmas=PRIOR_SIGMAS, **kw):
     return solve_gtsam(W['gyro'], W['acc'], W['dt'], W['kf_idx'], W['bgbar'], W['babar'],
                        R_true, W['v_t'], W['p_t'], W['blk'], X.ND_G, X.ND_A, prior_sigmas,
-                       X.GYRO_RW, X.ACCEL_RW, kf_interval=KFI, initialisation=init, seed=seed)
+                       X.GYRO_RW, X.ACCEL_RW, kf_interval=KFI, initialisation=init, seed=seed,
+                       **kw)
+
+
+def so3_log(R):
+    """Rotation vector (axis * angle, |.| <= pi) of R."""
+    R = np.asarray(R, float)
+    c = np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0); th = np.arccos(c)
+    if th < 1e-9:
+        return np.zeros(3)
+    if th > np.pi - 1e-6:
+        # near pi: axis from the symmetric part
+        A = (R + np.eye(3)) / 2.0
+        ax = A[:, int(np.argmax(np.diag(A)))]
+        return ax / np.linalg.norm(ax) * th
+    w = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]]) / (2.0 * np.sin(th))
+    return w * th
+
+
+def so3_exp(w):
+    w = np.asarray(w, float); th = np.linalg.norm(w)
+    if th < 1e-12:
+        return np.eye(3)
+    k = w / th; K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+    return np.eye(3) + np.sin(th) * K + (1 - np.cos(th)) * K @ K
 
 
 def initial_attitude(W, R_true, init, seed=0):

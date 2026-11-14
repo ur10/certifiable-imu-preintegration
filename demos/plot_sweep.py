@@ -1,4 +1,8 @@
-"""demos/out/sweep_*_carry.json -> demos/figures/sweep.png, plus a markdown summary table."""
+"""demos/out/sweep_*_carry_Rp0.05.json -> demos/figures/sweep.png, plus a markdown summary table.
+
+    python demos/plot_sweep.py [carry|gt] [R_prior|R|free] [r0_sigma]
+    # R_prior -> sweep.png; R -> sweep_R.png; free -> sweep_free.png
+"""
 import glob, json, os, sys
 import numpy as np
 import matplotlib
@@ -11,10 +15,14 @@ from plot_basins import style
 SEQS = ['MH_01_easy', 'MH_02_easy', 'MH_03_medium', 'MH_04_difficult']
 
 
-def load(bias='carry'):
+def tag(bias, gauge, r0_sigma=0.05):
+    return bias + {'free': '', 'R': '_R'}.get(gauge, '_Rp%g' % r0_sigma)
+
+
+def load(bias='carry', gauge='R_prior', r0_sigma=0.05):
     rows = []
     for s in SEQS:
-        fn = os.path.join(OUT, 'sweep_%s_%s.json' % (s, bias))
+        fn = os.path.join(OUT, 'sweep_%s_%s.json' % (s, tag(bias, gauge, r0_sigma)))
         if os.path.exists(fn):
             rows += [r for r in json.load(open(fn)) if 'failed' not in r]
     for r in rows:
@@ -38,8 +46,8 @@ def table(rows):
     return '\n'.join(lines)
 
 
-def main(bias='carry'):
-    rows = load(bias)
+def main(bias='carry', gauge='R_prior', r0_sigma=0.05):
+    rows = load(bias, gauge, r0_sigma)
     plt.rcParams['font.family'] = 'DejaVu Sans'
     fig = plt.figure(figsize=(11, 4.3))
     gs = fig.add_gridspec(1, 2, width_ratios=[1.35, 1], wspace=0.25)
@@ -75,7 +83,7 @@ def main(bias='carry'):
     sd = np.array([r['rot_err'] for r in rows]); lm = np.array([r['lm']['gnss']['rot_err'] for r in rows])
     bad = np.array([not r['lm']['gnss']['global_'] for r in rows])
     cert = np.array([r['certified'] for r in rows])
-    lo, hi = 0.05, 400
+    lo, hi = min(0.05, 0.7 * min(sd.min(), lm.min())), 400
     b.plot([lo, hi], [lo, hi], color=GREY, lw=1, zorder=1)
     kw = dict(s=34, linewidths=1.2, edgecolors='white', zorder=3)
     b.scatter(sd[cert], lm[cert], c=BLUE, **kw)
@@ -85,25 +93,29 @@ def main(bias='carry'):
     b.set_ylabel('LM from identity attitude (deg)', color=INK2, fontsize=9.5)
     b.set_title('Same windows, local solver', color=INK, fontsize=10.5, loc='left')
     if bad.any():
-        b.annotate('%d windows: LM stops ~%.0f° off;\nthe SDP certified all of them'
-                   % (bad.sum(), np.median(lm[bad])), xy=(np.max(sd[bad]), np.min(lm[bad])),
+        b.annotate('%d windows: LM stops ~%.0f° off;\nthe SDP certified %s'
+                   % (bad.sum(), np.median(lm[bad]),
+                      'all of them' if cert[bad].all() else '%d of them' % cert[bad].sum()), xy=(np.max(sd[bad]), np.min(lm[bad])),
                    xytext=(1.2, 60), fontsize=8, color=INK, ha='left', va='top',
                    arrowprops=dict(arrowstyle='-', color=INK2, lw=0.8))
     b.text(0.97, 0.04, 'on the diagonal: LM found the same answer\n(from a gravity-aligned start: '
            '%d of %d)' % (sum(r['lm']['gravity']['global_'] for r in rows), len(rows)),
            transform=b.transAxes, ha='right', va='bottom', fontsize=7.5, color=INK2)
 
-    fig.suptitle('EuRoC Machine Hall, back-to-back 16 s windows, GNSS (1 cm) + IMU, attitude '
-                 'unknown, bias carried window to window', x=0.01, ha='left', fontsize=9,
+    fig.suptitle('EuRoC Machine Hall, back-to-back 16 s windows, GNSS (1 cm) + IMU, attitude ' +
+                 {'free': 'unknown', 'R': 'fixed at the first keyframe'}.get(
+                     gauge, 'with a weak (%.0f°) prior on the first keyframe' % np.degrees(r0_sigma / np.sqrt(2))) +
+                 ', bias carried window to window', x=0.01, ha='left', fontsize=9,
                  color=INK2, y=0.995)
     fig.subplots_adjust(left=0.11, right=0.98, bottom=0.2, top=0.86)
     os.makedirs(FIG, exist_ok=True)
-    fn = os.path.join(FIG, 'sweep.png')
+    fn = os.path.join(FIG, 'sweep.png' if gauge == 'R_prior' else 'sweep_%s.png' % gauge)
     fig.savefig(fn, dpi=160, facecolor='white')
     md = table(rows)
-    open(os.path.join(OUT, 'sweep_%s.md' % bias), 'w').write(md + '\n')
+    open(os.path.join(OUT, 'sweep_%s.md' % tag(bias, gauge, r0_sigma)), 'w').write(md + '\n')
     print(md); print('wrote', fn)
 
 
 if __name__ == '__main__':
-    main(sys.argv[1] if len(sys.argv) > 1 else 'carry')
+    a = sys.argv[1:]
+    main(a[0] if a else 'carry', a[1] if len(a) > 1 else 'R_prior', float(a[2]) if len(a) > 2 else 0.05)

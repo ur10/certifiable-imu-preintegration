@@ -477,20 +477,24 @@ def reference_point(layout, edges, anchors, scalar_priors, info=None):
     reference. Nothing here uses the SDP solution or the ground truth beyond what the problem
     already contains as measurements/anchors. The certificate does not depend on xbar at all
     (the congruence is exact for any xbar); xbar only sets how well conditioned the solve is.
-    info (dict), if given, receives the source of R_0 and, for Wahba, its singular values.
+    info (dict), if given, receives the source of R_0 and the Wahba singular values (a heading-
+    observability diagnostic, reported whenever every node has GNSS priors, whatever the gauge).
     """
     ref = {idx: r for idx, r, tau in (scalar_priors or []) if tau > 0}
     info = {} if info is None else info
+    Rw, sv = wahba_R0(layout, edges, scalar_priors)
+    if sv is not None:
+        info['wahba_sv'] = [float(x) for x in sv]
     if anchors and 'R0' in anchors:
         R0 = np.asarray(anchors['R0'], float); info['R0_source'] = 'anchor'
     elif all(layout.R(0, r, c) in ref for r in range(3) for c in range(3)):
         R0 = project_to_so3(np.array([[ref[layout.R(0, r, c)] for c in range(3)] for r in range(3)]))
         info['R0_source'] = 'R_prior'
     else:
-        R0, sv = wahba_R0(layout, edges, scalar_priors)
+        R0 = Rw
         if R0 is None:
             return None
-        info.update(R0_source='wahba', R0_ref=R0, wahba_sv=[float(x) for x in sv])
+        info.update(R0_source='wahba', R0_ref=R0)
     R = [R0]
     for ed in edges:
         R.append(R[-1] @ ed.dRt)
@@ -1205,7 +1209,8 @@ def run_urbannav(root, sequence='medium', T=8.0, kf_interval=1.0, t_start=6.0, a
                  bias_interval=None, max_bias_precision=None, iso_reduce='max', iso_propagate=False,
                  solver_params=None, accept_any=False, diag=None, conditioning='centre_whiten',
                  static_window=5.0, gravity=None, rate=None, gauge_fix='R',
-                 R0_prior_sigma=None, recenter=True, kf_per_bias=None):
+                 R0_prior_sigma=None, recenter=True, kf_per_bias=None, gnss_seed=None,
+                 bias_init='static'):
     """UrbanNav (Hong Kong) twin of `run_euroc`.
 
     Structurally identical to `run_euroc` -- same edges, same weights, same constraints, same
@@ -1220,6 +1225,9 @@ def run_urbannav(root, sequence='medium', T=8.0, kf_interval=1.0, t_start=6.0, a
     1.0 s.  `noise_model` selects the accelerometer/gyro densities used by the MLE weights:
     'empirical' (measured from the stationary window) or 'datasheet' (the distributed
     xsens_imu_param.yaml, whose gyro density is 10-20x conservative).
+
+    `gnss_seed` and `bias_init` are as in `run_euroc`, except that the default bias is the static
+    estimate from the start of the sequence ('static'); pass (bg, ba) to linearise elsewhere.
     """
     seq = urbannav_data.load_sequence(root, sequence, rate=rate)
     t_all, gt, dt = seq['t'], seq['gt'], seq['dt']
@@ -1252,6 +1260,10 @@ def run_urbannav(root, sequence='medium', T=8.0, kf_interval=1.0, t_start=6.0, a
     # where the ground-truth biases are likewise unaffected by `noise_sigma`.
     bgbar, babar = urbannav_data.static_bias_init(t_all, seq['gyro'], seq['accel'], gt['R'][0],
                                                   window=static_window, gravity=g_local)
+    if not isinstance(bias_init, str):
+        bgbar = np.asarray(bias_init[0], float).copy(); babar = np.asarray(bias_init[1], float).copy()
+    elif bias_init != 'static':
+        raise ValueError("bias_init must be 'static' or (bg, ba); got %r" % (bias_init,))
 
     if weight_mode == 'dataset_cov':
         nd_inj = noise_sigma * np.sqrt(dt)
@@ -1303,8 +1315,11 @@ def run_urbannav(root, sequence='medium', T=8.0, kf_interval=1.0, t_start=6.0, a
     p_off = np.zeros(3)
     if recenter:
         p_t, p_off = _recenter(p_t)
+    v_m, p_m = v_t, p_t
+    if gnss_seed is not None:
+        v_m, p_m = simulate_gnss(v_t, p_t, prior_sigmas, gnss_seed)
     anchors, first_node, R0_prior = _gauge(gauge_fix, R_t, v_t, p_t, R0_prior_sigma)
-    priors = _build_scalar_priors(lay, v_t, p_t, bgbar, babar, w, first_node=first_node,
+    priors = _build_scalar_priors(lay, v_m, p_m, bgbar, babar, w, first_node=first_node,
                                   R0_prior=R0_prior)
     # Local gravity (9.7877 in Hong Kong) rather than the module default 9.81; the 0.24% difference
     # is the same order as the accelerometer bias, so it is not negligible for the velocity edges.
@@ -1328,6 +1343,8 @@ def run_urbannav(root, sequence='medium', T=8.0, kf_interval=1.0, t_start=6.0, a
                 bias_err_per_block=[float(np.linalg.norm(np.r_[bg[m] - bgbar, ba[m] - babar]))
                                     for m in range(M)],
                 Q_flag=gt['Q'][kidx], mean_speed=float(speed.mean()),
+                v_meas=v_m, p_meas=p_m, lat=gt['lat'][kidx], lon=gt['lon'][kidx],
+                heading_true=gt['heading'][kidx],
                 turn_deg=float(np.abs(np.diff(np.unwrap(np.deg2rad(gt['heading'][kidx])))).sum() * 180 / np.pi))
 
 

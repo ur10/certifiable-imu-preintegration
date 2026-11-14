@@ -14,6 +14,14 @@ dataset reports at take-off; every later window is linearised at, and given a pr
 previous window's SDP estimate (`--bias carry`, the default). `--bias gt` uses the dataset bias
 for every window instead, as the paper does.
 
+Gauge: `--gauge R_prior` (the default) puts a weak prior on the first keyframe's rotation: a
+penalty ||R_0 - R_true_0||_F^2 / sigma^2 in the cost, sigma = `--r0-sigma` = 0.05 per entry
+(about 2 deg), and LM gets the matching rotation prior (sigma / sqrt(2) rad). `--gauge R` is
+the hard version: R_0 fixed by an equality constraint, LM given a 1e-6 rad prior. `--gauge free`
+anchors nothing, so heading must come from horizontal acceleration alone; a window that starts
+on the ground before take-off (MH_03 at 0 s) is then genuinely ambiguous in heading, and the
+relaxation is not tight (rank 3).
+
     python demos/sequence_sweep.py --seq MH_04_difficult      # ~5 min per sequence
     python demos/plot_sweep.py                                # -> demos/figures/sweep_*.png
 """
@@ -33,13 +41,19 @@ def mean_err(Ra, Rb):
     return float(np.mean([rot_angle(a, b) for a, b in zip(Ra, Rb)]))
 
 
-def main(seq, bias='carry', step=T):
+def tag(bias, gauge, r0_sigma):
+    return bias + {'free': '', 'R': '_R'}.get(gauge, '_Rp%g' % r0_sigma)
+
+
+def main(seq, bias='carry', gauge='R_prior', r0_sigma=0.05, step=T):
+    gfix = {'R': 'R', 'free': False, 'R_prior': 'R_prior'}[gauge]
     starts = np.arange(0.0, duration(seq) - T - 0.5, step)
     rows, carried = [], None
     for wi, t0 in enumerate(starts):
         bi = 'gt' if (bias == 'gt' or carried is None) else carried
         tic = time.time()
-        r, W = solve_window(seq, float(t0), gnss_seed=1000 + wi, bias_init=bi)
+        r, W = solve_window(seq, float(t0), gnss_seed=1000 + wi, bias_init=bi, gauge_fix=gfix,
+                            R0_prior_sigma=r0_sigma if gauge == 'R_prior' else None)
         secs = time.time() - tic
         if r.get('rank') is None:
             rows.append(dict(seq=seq, t0=float(t0), failed=str(r.get('status'))))
@@ -47,7 +61,8 @@ def main(seq, bias='carry', step=T):
             continue
         R_t = r['R_true']
         hd, tl = heading_tilt(r['R_est'], R_t)
-        row = dict(seq=seq, t0=float(t0), bias_mode='gt' if isinstance(bi, str) else 'carry',
+        row = dict(seq=seq, t0=float(t0), gauge=gauge, r0_sigma=r0_sigma if gauge == 'R_prior' else None,
+                   bias_mode='gt' if isinstance(bi, str) else 'carry',
                    rank=int(r['rank']), eta=float(r['eta']), eta_dual=r['eta_dual'],
                    log_svr=float(r['log_svr']), solsta=r.get('solsta'), certified=certified(r),
                    secs=secs, rot_err=float(np.mean(r['rot_err'])), heading_err=hd, tilt_err=tl,
@@ -57,9 +72,12 @@ def main(seq, bias='carry', step=T):
                                                             r['babar'] - r['ba_true']])),
                    p_true=(np.asarray(r['pos']) + r['pos_offset']).tolist(),
                    p_est=(np.asarray(r['p_est']) + r['pos_offset']).tolist(), lm={})
-        ref = run_lm(W, R_t, 'gt')
+        lkw = {} if not gfix else dict(anchor_R0=np.asarray(R_t[0]))
+        if gauge == 'R_prior':
+            lkw['anchor_sigma'] = r0_sigma / np.sqrt(2.0)
+        ref = run_lm(W, R_t, 'gt', **lkw)
         for init in ('gt', 'gravity', 'gnss'):
-            g = ref if init == 'gt' else run_lm(W, R_t, init)
+            g = ref if init == 'gt' else run_lm(W, R_t, init, **lkw)
             ghd, gtl = heading_tilt(g['R_est'], R_t)
             row['lm'][init] = dict(rot_err=mean_err(g['R_est'], R_t), heading_err=ghd, tilt_err=gtl,
                                    vs_sdp=mean_err(g['R_est'], r['R_est']), cost=g['cost'],
@@ -76,7 +94,7 @@ def main(seq, bias='carry', step=T):
                  lm['gravity']['rot_err'], '' if lm['gravity']['global_'] else '*',
                  lm['gnss']['rot_err'], '' if lm['gnss']['global_'] else '*', secs), flush=True)
     os.makedirs(OUT, exist_ok=True)
-    fn = os.path.join(OUT, 'sweep_%s_%s.json' % (seq, bias))
+    fn = os.path.join(OUT, 'sweep_%s_%s.json' % (seq, tag(bias, gauge, r0_sigma)))
     json.dump(rows, open(fn, 'w'), indent=1)
     print('wrote', fn)
 
@@ -85,5 +103,7 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--seq', default='MH_04_difficult', choices=datasets.EUROC_SEQUENCES)
     ap.add_argument('--bias', default='carry', choices=['carry', 'gt'])
+    ap.add_argument('--gauge', default='R_prior', choices=['R_prior', 'R', 'free'])
+    ap.add_argument('--r0-sigma', type=float, default=0.05, help="R_prior strength, per matrix entry")
     a = ap.parse_args()
-    main(a.seq, a.bias)
+    main(a.seq, a.bias, a.gauge, a.r0_sigma)

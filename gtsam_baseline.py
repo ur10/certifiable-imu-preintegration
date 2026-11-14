@@ -134,7 +134,7 @@ def solve_gtsam(gyro, acc, dt, kf_idx, bgbar, babar, R_t, v_t, p_t, blk,
                 gravity=9.81, initialisation='gnss', seed=0,
                 rot_sigma_deg=0.0, pos_sigma=0.0, heading_deg=0.0, integration_sigma=1e-6,
                 bias_init_k=0.0, max_iter=200, lambda_upper=1e12, anchor_R0=None,
-                anchor_sigma=1e-6, bias_prior_sigmas=None):
+                anchor_sigma=1e-6, bias_prior_sigmas=None, R_init=None, record=False):
     """Build and solve the exp-map factor graph. kf_idx[k] indexes the IMU stream at node k.
 
     anchor_R0 (3x3) adds a rotation-only prior on X(0) with stddev anchor_sigma [rad], the LM
@@ -142,6 +142,10 @@ def solve_gtsam(gyro, acc, dt, kf_idx, bgbar, babar, R_t, v_t, p_t, blk,
 
     bias_prior_sigmas=(sigma_bg, sigma_ba) overrides the B_0 prior, which otherwise comes from the
     random walk over the window (the SDP's bias_prior_rw=False counterpart).
+
+    R_init (list of N rotations) replaces the attitude part of the initial guess. record=True
+    steps LM one iteration at a time and returns every iterate's attitudes in 'R_path' (the
+    stopping rule mirrors GTSAM's: relative cost decrease below 1e-5).
     """
     rng = np.random.default_rng(seed)
     N = len(kf_idx)
@@ -198,6 +202,8 @@ def solve_gtsam(gyro, acc, dt, kf_idx, bgbar, babar, R_t, v_t, p_t, blk,
         if kf_idx[-1] > kf_idx[0] else np.array([0.0, 0.0, gravity])
     R0, v0, p0 = _navstate_init(initialisation, R_t, v_t, p_t, rng, rot_sigma_deg, pos_sigma,
                                 a_mean=a_mean, gravity=gravity, heading_deg=heading_deg)
+    if R_init is not None:
+        R0 = [np.asarray(R, float) for R in R_init]
     vals = gtsam.Values()
     for k in range(N):
         vals.insert(X(k), gtsam.Pose3(gtsam.Rot3(R0[k]), p0[k]))
@@ -217,7 +223,21 @@ def solve_gtsam(gyro, acc, dt, kf_idx, bgbar, babar, R_t, v_t, p_t, blk,
     lm.setlambdaUpperBound(lambda_upper)   # default 1e5 aborts at iteration 0 from a poor guess
     opt = gtsam.LevenbergMarquardtOptimizer(graph, vals, lm)
     t0 = time.time()
-    res = opt.optimize()
+    R_path = None
+    if record:
+        R_path = [[np.asarray(R, float) for R in R0]]
+        err = graph.error(vals)
+        for _ in range(max_iter):
+            opt.iterate()
+            cur = opt.values()
+            R_path.append([cur.atPose3(X(k)).rotation().matrix() for k in range(N)])
+            new = graph.error(cur)
+            if err - new <= 1e-5 * err:
+                break
+            err = new
+        res = opt.values()
+    else:
+        res = opt.optimize()
     secs = time.time() - t0
 
     R_e = [res.atPose3(X(k)).rotation().matrix() for k in range(N)]
@@ -228,4 +248,4 @@ def solve_gtsam(gyro, acc, dt, kf_idx, bgbar, babar, R_t, v_t, p_t, blk,
                 bg=[b.gyroscope() for b in bias], ba=[b.accelerometer() for b in bias],
                 cost0=float(graph.error(vals)), cost=float(graph.error(res)),
                 iters=int(opt.iterations()), secs=secs, num_bias=M,
-                initialisation=initialisation)
+                initialisation=initialisation, R_path=R_path)
