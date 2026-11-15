@@ -31,17 +31,6 @@ This repository contains the reference implementation, paper-reproduction script
 
 ## Method
 
-```mermaid
-flowchart TD
-    A["IMU measurements + GNSS position/velocity fixes"] --> B["Cayley preintegration + state–bias lifting"]
-    B --> C["QCQP estimation problem"]
-    C --> D["Shor SDP + redundant constraints"]
-    D --> E["Recovered state estimate"]
-    D --> F["Dual lower bound"]
-    E --> G["Feasibility, rank and optimality-gap checks"]
-    F --> G
-    G --> H["Certified to tolerance / not certified"]
-```
 
 **Why change the preintegration factor?** The exponential map in the conventional formulation is an obstacle to an exact polynomial representation. The Cayley map is rational, allowing algebraic relations to be constructed and lifted into quadratic form. This is a reformulation of the inertial model; it is not a certificate for an unchanged exponential-map objective.
 
