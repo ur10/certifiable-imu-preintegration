@@ -218,12 +218,6 @@ uv venv .venv-web && uv pip install -p .venv-web viser==0.2.23 trimesh
 The script builds both recordings from `demos/out/` on first use, serves them at
 `http://localhost:8000`, and prints the two links to open.
 
-## Scope and current limitations
-
-- **Windowed reference implementation.** The demos solve 16 s windows with MOSEK. The reported timings do not establish a real-time navigation backend.
-- **Initialization and prior information are different.** The SDP does not require a user-supplied trajectory starting point, but the problem still uses measurements, bias linearization points, and any configured priors. The flight sweep starts its first window from the dataset bias and propagates subsequent bias estimates.
-- **Tightness depends on the instance.** Degraded GNSS and stationary driving intervals include non-certified windows. The method does not guarantee a rank-one relaxation for arbitrary noise or motion.
-- **The guarantee is model-specific.** Certification applies to the implemented Cayley formulation and its weighting assumptions. Weak observability, model mismatch, or inaccurate measurements can still produce an inaccurate certified estimate.
 
 ## Quick start
 
